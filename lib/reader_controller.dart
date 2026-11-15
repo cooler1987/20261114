@@ -574,7 +574,7 @@ class ReaderController extends ChangeNotifier {
       final List<BookParagraph> newParas = res['paragraphs'];
       final List<TextSliceNode> newNodes = res['nodes'];
       final int size = res['fileSize'];
-      final bool fromCache = res['fromCache'] == true;
+      final bool fromCache = res['cacheHit'] == true;
       final String name = path.split(Platform.pathSeparator).last;
 
       int startIdx = 0;
