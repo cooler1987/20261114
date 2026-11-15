@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 
 // ────────────────── 基础常数与发音人字典 ──────────────────
@@ -79,6 +80,124 @@ String normalizeEngineNetworkMode(String? raw) {
   return 'direct';
 }
 
+// ────────────────── 阅读器主题配置 ──────────────────
+class ReaderThemeConfig {
+  final String id;
+  final String name;
+  final Brightness brightness;
+  final Color scaffoldBg;
+  final Color surfaceBg;
+  final Color sidebarBg;
+  final Color cardBorder;
+  final Color chipBg;
+  final Color primaryText;
+  final Color secondaryText;
+  final Color accent;
+  final Color highlightBg;
+  final Color highlightText;
+  final Color searchMatchBg;
+  final Color searchMatchText;
+
+  const ReaderThemeConfig({
+    required this.id,
+    required this.name,
+    required this.brightness,
+    required this.scaffoldBg,
+    required this.surfaceBg,
+    required this.sidebarBg,
+    required this.cardBorder,
+    required this.chipBg,
+    required this.primaryText,
+    required this.secondaryText,
+    required this.accent,
+    required this.highlightBg,
+    required this.highlightText,
+    required this.searchMatchBg,
+    required this.searchMatchText,
+  });
+
+  static const ReaderThemeConfig parchment = ReaderThemeConfig(
+    id: 'parchment',
+    name: '羊皮纸',
+    brightness: Brightness.light,
+    scaffoldBg: Color(0xFFF6F4EC),
+    surfaceBg: Color(0xFFFCFBF7),
+    sidebarBg: Color(0xFFF0EDE4),
+    cardBorder: Color(0xFFE5E2D9),
+    chipBg: Color(0xFFF3EEE1),
+    primaryText: Color(0xFF2D2E2F),
+    secondaryText: Color(0xFF607D8B),
+    accent: Color(0xFFC87D2E),
+    highlightBg: Color(0xFFEFE2C3),
+    highlightText: Color(0xFF743C00),
+    searchMatchBg: Color(0xFFFFD54F),
+    searchMatchText: Color(0xFF4A2500),
+  );
+
+  static const ReaderThemeConfig green = ReaderThemeConfig(
+    id: 'green',
+    name: '护眼绿',
+    brightness: Brightness.light,
+    scaffoldBg: Color(0xFFE3EDCD),
+    surfaceBg: Color(0xFFECF4DC),
+    sidebarBg: Color(0xFFDCE8C4),
+    cardBorder: Color(0xFFC9D9AE),
+    chipBg: Color(0xFFD9E6BE),
+    primaryText: Color(0xFF24331E),
+    secondaryText: Color(0xFF53694D),
+    accent: Color(0xFF3E7B38),
+    highlightBg: Color(0xFFC8DFA6),
+    highlightText: Color(0xFF1D4D18),
+    searchMatchBg: Color(0xFFFFE082),
+    searchMatchText: Color(0xFF3B2800),
+  );
+
+  static const ReaderThemeConfig dark = ReaderThemeConfig(
+    id: 'dark',
+    name: '深邃夜',
+    brightness: Brightness.dark,
+    scaffoldBg: Color(0xFF16181A),
+    surfaceBg: Color(0xFF1F2226),
+    sidebarBg: Color(0xFF1A1C1F),
+    cardBorder: Color(0xFF2E3238),
+    chipBg: Color(0xFF282C32),
+    primaryText: Color(0xFFD2D5D9),
+    secondaryText: Color(0xFF8B949E),
+    accent: Color(0xFFDF9B4F),
+    highlightBg: Color(0xFF3D301C),
+    highlightText: Color(0xFFFFD79A),
+    searchMatchBg: Color(0xFF7D5D00),
+    searchMatchText: Color(0xFFFFF3CC),
+  );
+
+  static const ReaderThemeConfig white = ReaderThemeConfig(
+    id: 'white',
+    name: '极简白',
+    brightness: Brightness.light,
+    scaffoldBg: Color(0xFFFFFFFF),
+    surfaceBg: Color(0xFFF9F9FB),
+    sidebarBg: Color(0xFFF3F4F6),
+    cardBorder: Color(0xFFE5E7EB),
+    chipBg: Color(0xFFF1F3F5),
+    primaryText: Color(0xFF1F2328),
+    secondaryText: Color(0xFF656D76),
+    accent: Color(0xFFB56A1E),
+    highlightBg: Color(0xFFFFF0D4),
+    highlightText: Color(0xFF6B3700),
+    searchMatchBg: Color(0xFFFFD54F),
+    searchMatchText: Color(0xFF4A2500),
+  );
+
+  static const List<ReaderThemeConfig> presets = [parchment, green, dark, white];
+
+  static ReaderThemeConfig byId(String? id) {
+    for (final t in presets) {
+      if (t.id == id) return t;
+    }
+    return parchment;
+  }
+}
+
 // ────────────────── 自定义 TTS 引擎模型 ──────────────────
 class CustomTtsEngineConfig {
   final String id;
@@ -86,13 +205,15 @@ class CustomTtsEngineConfig {
   String method; // POST / GET
   String url; // 支持模板变量 {{text_url}}, {{voice}}, {{speed}}, {{bitrate}}, {{api_key}}
   Map<String, String> headers;
-  String bodyTemplate; // POST 请求体，支持 {{text_json}}, {{text}}, {{voice}}, {{speed}}, {{rate_percent}}, {{bitrate}}, {{api_key}}
+  String bodyTemplate; // 支持 {{text_json}}, {{text_xml}}, {{text}}, {{voice}}, {{speed}}, {{rate_percent}}, {{bitrate}}, {{api_key}}
   String responseType; // 'raw_bytes' | 'json_base64' | 'json_url'
-  String jsonPath; // 例: choices[0].message.audio.data 或 data.audio
+  String jsonPath; // 例: choices[0].message.audio.data
   String apiKey;
   Map<String, String> voices; // voiceId -> displayName
-  String networkMode; // 'direct' (默认) | 'system' | 'custom'
-  String customProxy; // 当 networkMode == 'custom' 时生效，如 127.0.0.1:7890 或 7890
+  String networkMode; // 'direct' | 'system' | 'custom'
+  String customProxy;
+  bool ignoreBadCert;
+  String testText;
 
   CustomTtsEngineConfig({
     required this.id,
@@ -107,6 +228,8 @@ class CustomTtsEngineConfig {
     Map<String, String>? voices,
     this.networkMode = 'direct',
     this.customProxy = '',
+    this.ignoreBadCert = false,
+    this.testText = '',
   })  : headers = headers ?? {'Content-Type': 'application/json'},
         voices = (voices == null || voices.isEmpty) ? {'default': '默认音色'} : voices;
 
@@ -123,6 +246,8 @@ class CustomTtsEngineConfig {
         'voices': voices,
         'networkMode': networkMode,
         'customProxy': customProxy,
+        'ignoreBadCert': ignoreBadCert,
+        'testText': testText,
       };
 
   factory CustomTtsEngineConfig.fromJson(Map<String, dynamic> json) {
@@ -136,7 +261,6 @@ class CustomTtsEngineConfig {
     if (rawVoices is Map) {
       rawVoices.forEach((k, v) => voicesMap[k.toString()] = v.toString());
     }
-    final netMode = normalizeEngineNetworkMode(json['networkMode']?.toString());
     return CustomTtsEngineConfig(
       id: (json['id'] as String?)?.isNotEmpty == true ? json['id'] as String : 'custom_${DateTime.now().millisecondsSinceEpoch}',
       name: (json['name'] as String?)?.isNotEmpty == true ? json['name'] as String : '自定义TTS引擎',
@@ -148,8 +272,10 @@ class CustomTtsEngineConfig {
       jsonPath: json['jsonPath'] as String? ?? '',
       apiKey: json['apiKey'] as String? ?? '',
       voices: voicesMap.isEmpty ? {'default': '默认音色'} : voicesMap,
-      networkMode: netMode,
+      networkMode: normalizeEngineNetworkMode(json['networkMode']?.toString()),
       customProxy: json['customProxy'] as String? ?? '',
+      ignoreBadCert: json['ignoreBadCert'] == true,
+      testText: json['testText'] as String? ?? '',
     );
   }
 
@@ -169,11 +295,13 @@ class CustomTtsEngineConfig {
       voices: Map<String, String>.from(voices),
       networkMode: networkMode,
       customProxy: customProxy,
+      ignoreBadCert: ignoreBadCert,
+      testText: testText,
     );
   }
 }
 
-// ────────────────── 核心历史模型 (CharOffset 锚点) ──────────────────
+// ────────────────── 核心历史与文本结构模型 ──────────────────
 class BookHistoryItem {
   final String fingerprint;
   String lastKnownPath;
@@ -226,17 +354,48 @@ class BookHistoryItem {
       );
 }
 
+/// 自然段渲染单元（彻底告别“一句一框”割裂感）
+class BookParagraph {
+  final String text;
+  final int startOffset;
+  final int endOffset;
+
+  const BookParagraph({
+    required this.text,
+    required this.startOffset,
+    required this.endOffset,
+  });
+}
+
+/// TTS 听书切片单元（支持智能合并短句 >= X 字）
 class TextSliceNode {
   final String text;
   final int startOffset;
   final int endOffset;
-  const TextSliceNode({required this.text, required this.startOffset, required this.endOffset});
+
+  const TextSliceNode({
+    required this.text,
+    required this.startOffset,
+    required this.endOffset,
+  });
+}
+
+class SearchHit {
+  final int charOffset;
+  final int sliceIndex;
+  final int paraIndex;
+
+  const SearchHit({
+    required this.charOffset,
+    required this.sliceIndex,
+    required this.paraIndex,
+  });
 }
 
 // ────────────────── 大纲章节模型 (支持层级缩进树) ──────────────────
 class BookChapter {
   final String title;
-  final int paragraphIndex;
+  final int paragraphIndex; // 对齐到 TextSliceNode 索引
   final int charOffset;
   final int level;
 
@@ -256,8 +415,8 @@ class BookChapter {
 
   factory BookChapter.fromMap(Map<String, dynamic> map) => BookChapter(
         title: map['title'] ?? '',
-        paragraphIndex: map['pIdx'] ?? 0,
-        charOffset: map['charOffset'] ?? 0,
+        paragraphIndex: (map['pIdx'] as num?)?.toInt() ?? 0,
+        charOffset: (map['charOffset'] as num?)?.toInt() ?? 0,
         level: (map['level'] as num?)?.toInt() ?? 0,
       );
 }
@@ -334,9 +493,7 @@ Uint8List stripId3Tags(Uint8List data) {
   if (end >= 10 && data[0] == 0x49 && data[1] == 0x44 && data[2] == 0x33) {
     int tagSize = ((data[6] & 0x7F) << 21) | ((data[7] & 0x7F) << 14) | ((data[8] & 0x7F) << 7) | (data[9] & 0x7F);
     int totalHeader = 10 + tagSize;
-    if (totalHeader < end) {
-      start = totalHeader;
-    }
+    if (totalHeader < end) start = totalHeader;
   }
 
   if (end - start > 128 && data[end - 128] == 0x54 && data[end - 127] == 0x41 && data[end - 126] == 0x47) {
@@ -345,4 +502,105 @@ Uint8List stripId3Tags(Uint8List data) {
 
   if (start == 0 && end == data.length) return data;
   return data.sublist(start, end);
+}
+
+// ────────────────── MP3/WAV 安全拼接清洗工具 (解决 VBR Xing 时长错乱) ──────────────────
+class Mp3MergeHelper {
+  static bool isWavData(Uint8List data) {
+    return data.length >= 12 &&
+        data[0] == 0x52 && data[1] == 0x49 && data[2] == 0x46 && data[3] == 0x46 &&
+        data[8] == 0x57 && data[9] == 0x41 && data[10] == 0x56 && data[11] == 0x45;
+  }
+
+  /// 剥离 ID3v2 / ID3v1 及首帧可能附带的 Xing / Info VBR 元数据帧，防止合并后播放器误判总时长
+  static Uint8List cleanMp3Chunk(Uint8List raw) {
+    final cleaned = stripId3Tags(raw);
+    if (cleaned.length < 48) return cleaned;
+
+    // 定位第一个有效的 MPEG Sync 帧头 (11 个连续 1 bit: 0xFF 0xE0)
+    int frameStart = -1;
+    final scanLimit = min(cleaned.length - 4, 2048);
+    for (int i = 0; i < scanLimit; i++) {
+      if (cleaned[i] == 0xFF && (cleaned[i + 1] & 0xE0) == 0xE0) {
+        final layer = (cleaned[i + 1] >> 1) & 0x03;
+        final bitrateIdx = (cleaned[i + 2] >> 4) & 0x0F;
+        final srIdx = (cleaned[i + 2] >> 2) & 0x03;
+        if (layer != 0 && bitrateIdx != 0x0F && srIdx != 0x03) {
+          frameStart = i;
+          break;
+        }
+      }
+    }
+    if (frameStart < 0) return cleaned;
+
+    final frameLen = _calcMpegFrameSize(cleaned, frameStart);
+    if (frameLen <= 0 || frameStart + frameLen > cleaned.length) {
+      return frameStart > 0 ? cleaned.sublist(frameStart) : cleaned;
+    }
+
+    // 检查该首帧内是否包含 "Xing" 或 "Info" 标记
+    final inspectEnd = min(frameStart + frameLen, frameStart + 64);
+    bool isXingOrInfo = false;
+    for (int i = frameStart + 4; i <= inspectEnd - 4; i++) {
+      final b0 = cleaned[i], b1 = cleaned[i + 1], b2 = cleaned[i + 2], b3 = cleaned[i + 3];
+      if ((b0 == 0x58 && b1 == 0x69 && b2 == 0x6E && b3 == 0x67) || // Xing
+          (b0 == 0x49 && b1 == 0x6E && b2 == 0x66 && b3 == 0x6F)) { // Info
+        isXingOrInfo = true;
+        break;
+      }
+    }
+
+    if (isXingOrInfo) {
+      final afterXing = frameStart + frameLen;
+      return afterXing < cleaned.length ? cleaned.sublist(afterXing) : Uint8List(0);
+    }
+    return frameStart > 0 ? cleaned.sublist(frameStart) : cleaned;
+  }
+
+  static int _calcMpegFrameSize(Uint8List b, int off) {
+    if (off + 4 > b.length) return -1;
+    final h1 = b[off + 1];
+    final h2 = b[off + 2];
+    final versionBits = (h1 >> 3) & 0x03; // 3=MPEG1, 2=MPEG2, 0=MPEG2.5
+    final layerBits = (h1 >> 1) & 0x03;   // 1=Layer III
+    final bitrateIdx = (h2 >> 4) & 0x0F;
+    final srIdx = (h2 >> 2) & 0x03;
+    final padding = (h2 >> 1) & 0x01;
+
+    if (versionBits == 1 || layerBits != 1 || bitrateIdx == 0 || bitrateIdx == 15 || srIdx == 3) {
+      return -1;
+    }
+
+    const mpeg1Rates = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0];
+    const mpeg2Rates = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0];
+    const srTableMPEG1 = [44100, 48000, 32000];
+    const srTableMPEG2 = [22050, 24000, 16000];
+    const srTableMPEG25 = [11025, 12000, 8000];
+
+    final isMpeg1 = versionBits == 3;
+    final bitrate = (isMpeg1 ? mpeg1Rates[bitrateIdx] : mpeg2Rates[bitrateIdx]) * 1000;
+    final sr = isMpeg1
+        ? srTableMPEG1[srIdx]
+        : (versionBits == 2 ? srTableMPEG2[srIdx] : srTableMPEG25[srIdx]);
+
+    if (bitrate == 0 || sr == 0) return -1;
+    final coeff = isMpeg1 ? 144 : 72;
+    return (coeff * bitrate) ~/ sr + padding;
+  }
+
+  /// 兼容部分自定义引擎返回 WAV 音频的情况
+  static Uint8List cleanWavChunk(Uint8List data, {required bool keepHeader}) {
+    if (!isWavData(data)) return data;
+    int pos = 12;
+    while (pos + 8 <= data.length) {
+      final isData = data[pos] == 0x64 && data[pos + 1] == 0x61 && data[pos + 2] == 0x74 && data[pos + 3] == 0x61; // 'data'
+      if (isData) {
+        final audioStart = pos + 8;
+        return keepHeader ? data : (audioStart < data.length ? data.sublist(audioStart) : Uint8List(0));
+      }
+      final chunkSize = data[pos + 4] | (data[pos + 5] << 8) | (data[pos + 6] << 16) | (data[pos + 7] << 24);
+      pos += 8 + chunkSize + (chunkSize.isOdd ? 1 : 0);
+    }
+    return keepHeader ? data : (data.length > 44 ? data.sublist(44) : Uint8List(0));
+  }
 }
