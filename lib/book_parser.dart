@@ -88,17 +88,14 @@ class BookParser {
   /// 支持 UTF-8 BOM、UTF-16LE/BE、UTF-8 与 GBK 兜底解码
   static String safeDecode(Uint8List bytes) {
     if (bytes.isEmpty) return "";
-    // UTF-8 BOM
     if (bytes.length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
       try {
         return utf8.decode(bytes.sublist(3));
       } catch (_) {}
     }
-    // UTF-16 LE BOM
     if (bytes.length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
       return _decodeUtf16(bytes.sublist(2), littleEndian: true);
     }
-    // UTF-16 BE BOM
     if (bytes.length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
       return _decodeUtf16(bytes.sublist(2), littleEndian: false);
     }
@@ -258,7 +255,6 @@ class BookParser {
         }
       }
 
-      // 优先解析 EPUB 2 NCX；若缺失则解析 EPUB 3 Nav，支持同文件多锚点章节
       final Map<String, List<_TocEntry>> tocByDocPath = {};
 
       if (ncxHref != null) {
@@ -348,7 +344,6 @@ class BookParser {
         final tocEntries = tocByDocPath[docKey];
 
         if (tocEntries != null && tocEntries.length > 1 && tocEntries.any((e) => e.fragmentId != null)) {
-          // 同一 HTML 文件内包含多个锚点章节
           final docBaseOffset = buffer.length;
           final plainFull = stripHtml(rawHtml);
           if (plainFull.trim().isNotEmpty) {
@@ -447,7 +442,6 @@ class BookParser {
       }
       fullContent = buffer.toString();
     } else {
-      // TXT 高可靠段落与防误判大纲抽取
       final raw = safeDecode(bytes);
       final volumeReg = RegExp(r'^\s*(第[0-9一二三四五六七八九十百千两]+[卷部集册分](?:$|[\s：:][^\r\n]{0,35}))');
       final chapterReg = RegExp(
@@ -475,7 +469,6 @@ class BookParser {
       fullContent = buffer.toString();
     }
 
-    // 层级自适应归一化
     if (chapters.isNotEmpty) {
       final minLevel = chapters.map((c) => c.level).fold<int>(99, (prev, elem) => min(prev, elem));
       if (minLevel > 0) {
@@ -498,7 +491,6 @@ class BookParser {
     };
   }
 
-  /// 对超长段落/长句按次级标点二次拆分为适合 TTS 合成的长度，同时保留精确字符偏移
   static void _emitSafeSlices(List<TextSliceNode> out, String text, int baseStart) {
     if (text.length <= maxSliceChars) {
       out.add(TextSliceNode(text: text, startOffset: baseStart, endOffset: baseStart + text.length));
@@ -522,7 +514,6 @@ class BookParser {
         final ch = text[i];
         if ('，,、：:;； '.contains(ch)) {
           cut = i + 1;
-          // 将紧邻闭引号或右括号一并保留在前句
           while (cut < text.length && '”’」』）)'.contains(text[cut])) {
             cut++;
           }
@@ -542,7 +533,6 @@ class BookParser {
     }
   }
 
-  // ────────────────── 健壮文本切片 (支持引号吸附与超长保护) ──────────────────
   static List<TextSliceNode> sliceContent(String fullContent, String splitMode) {
     final nodes = <TextSliceNode>[];
     if (fullContent.isEmpty) return nodes;
@@ -559,7 +549,6 @@ class BookParser {
         }
       }
     } else {
-      // 句末标点后把闭引号/右括号吸附进当前句，避免 ” 挂在下一句句首
       final matches = RegExp(r'[^。！？；?!;\r\n]+(?:[。！？；?!;]+[”’」』）\)]*|\r?\n+)?').allMatches(fullContent);
       for (final m in matches) {
         final trimmed = m.group(0)?.trim() ?? '';
@@ -607,4 +596,3 @@ class BookParser {
         .toList();
   }
 }
-                              
