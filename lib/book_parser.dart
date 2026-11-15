@@ -52,36 +52,173 @@ class _TocEntry {
 
 class BookParser {
   static const int maxSliceChars = 280;
+  static const int maxParsedCacheBooks = 5;
 
-  /// 在独立 Isolate 中完成文件读取、解码、目录抽提、切片与章节对齐，彻底避免主线程卡顿
-  static Future<Map<String, dynamic>> openBookInIsolate(String filePath, String splitMode) {
+  static final RegExp _hasReadableReg = RegExp(r'[\p{L}\p{N}]', unicode: true);
+  static const Set<String> _englishAbbreviations = {
+    'mr', 'mrs', 'ms', 'dr', 'prof', 'sr', 'jr', 'st', 'vs', 'etc',
+    'no', 'vol', 'fig', 'inc', 'ltd', 'co', 'corp', 'jan', 'feb', 'mar',
+    'apr', 'aug', 'sep', 'sept', 'oct', 'nov', 'dec', 'eg', 'ie',
+  };
+
+  /// 在独立 Isolate 中完成文件读取/缓存命中、解码、目录抽提、段落抽取、智能切片与章节对齐
+  static Future<Map<String, dynamic>> openBookInIsolate(
+    String filePath,
+    String splitMode,
+    int mergeMinChars, {
+    String? cacheDirPath,
+  }) {
     return Isolate.run(() async {
-      final parsed = await extractFullTextAndChapters(filePath);
-      final String fullContent = parsed['fullContent'] as String;
-      final List<BookChapter> rawChapters = parsed['chapters'] as List<BookChapter>;
-      final List<TextSliceNode> nodes = sliceContent(fullContent, splitMode);
+      final file = File(filePath);
+      final fingerprint = await BookFingerprint.generate(file);
+      final int diskSize = await file.length();
+
+      String? fullContent;
+      List<BookChapter>? rawChapters;
+      int fileSize = diskSize;
+      bool fromCache = false;
+
+      // 尝试命中本地解析缓存（大文件二次打开免解码与 HTML 清洗）
+      if (cacheDirPath != null && fingerprint.isNotEmpty) {
+        try {
+          final cacheFile = File('$cacheDirPath${Platform.pathSeparator}parsed_$fingerprint.json');
+          if (await cacheFile.exists()) {
+            final decoded = jsonDecode(await cacheFile.readAsString());
+            if (decoded is Map && decoded['fileSize'] == diskSize && decoded['fullContent'] is String) {
+              fullContent = decoded['fullContent'] as String;
+              final rawList = decoded['chapters'];
+              if (rawList is List) {
+                rawChapters = rawList
+                    .whereType<Map>()
+                    .map((m) => BookChapter.fromMap(Map<String, dynamic>.from(m)))
+                    .toList();
+              } else {
+                rawChapters = [];
+              }
+              fromCache = true;
+              // 刷新缓存时间以支持 LRU 清理
+              try {
+                await cacheFile.setLastModified(DateTime.now());
+              } catch (_) {}
+            }
+          }
+        } catch (_) {}
+      }
+
+      if (fullContent == null || rawChapters == null) {
+        final parsed = await extractFullTextAndChapters(filePath, presetFingerprint: fingerprint);
+        fullContent = parsed['fullContent'] as String;
+        rawChapters = parsed['chapters'] as List<BookChapter>;
+        fileSize = parsed['fileSize'] as int;
+
+        if (cacheDirPath != null && fingerprint.isNotEmpty && fullContent.isNotEmpty) {
+          _writeParsedCache(cacheDirPath, fingerprint, fileSize, fullContent, rawChapters);
+        }
+      }
+
+      final sliced = parseParagraphsAndSlices(fullContent, rawChapters, splitMode, mergeMinChars);
+      final List<BookParagraph> paragraphs = sliced['paragraphs'] as List<BookParagraph>;
+      final List<TextSliceNode> nodes = sliced['nodes'] as List<TextSliceNode>;
       final List<BookChapter> alignedChapters = alignChapters(rawChapters, nodes);
+
       return {
-        'fingerprint': parsed['fingerprint'],
+        'fingerprint': fingerprint,
         'fullContent': fullContent,
-        'fileSize': parsed['fileSize'],
+        'fileSize': fileSize,
         'rawChapters': rawChapters,
         'alignedChapters': alignedChapters,
+        'paragraphs': paragraphs,
         'nodes': nodes,
+        'fromCache': fromCache,
       };
     });
   }
 
-  /// 切换断句模式时在后台 Isolate 重切片
+  static Future<void> _writeParsedCache(
+    String cacheDirPath,
+    String fingerprint,
+    int fileSize,
+    String fullContent,
+    List<BookChapter> chapters,
+  ) async {
+    try {
+      final dir = Directory(cacheDirPath);
+      if (!await dir.exists()) await dir.create(recursive: true);
+
+      final cacheFile = File('$cacheDirPath${Platform.pathSeparator}parsed_$fingerprint.json');
+      final tmpFile = File('${cacheFile.path}.tmp');
+      final payload = jsonEncode({
+        'version': 1,
+        'fileSize': fileSize,
+        'fullContent': fullContent,
+        'chapters': chapters.map((c) => c.toMap()).toList(),
+      });
+      await tmpFile.writeAsString(payload, flush: true);
+      await tmpFile.rename(cacheFile.path);
+
+      // 清理超过上限的旧缓存文件
+      final allCaches = <File>[];
+      await for (final e in dir.list(followLinks: false)) {
+        if (e is File && e.path.endsWith('.json') && e.path.contains('parsed_')) {
+          allCaches.add(e);
+        }
+      }
+      if (allCaches.length > maxParsedCacheBooks) {
+        allCaches.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+        for (int i = maxParsedCacheBooks; i < allCaches.length; i++) {
+          try {
+            await allCaches[i].delete();
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
+  /// 切换断句模式或智能合并阈值时在后台 Isolate 重切片
   static Future<Map<String, dynamic>> resliceInIsolate(
     String fullContent,
     List<BookChapter> rawChapters,
     String splitMode,
+    int mergeMinChars,
   ) {
     return Isolate.run(() {
-      final nodes = sliceContent(fullContent, splitMode);
-      final aligned = alignChapters(rawChapters, nodes);
-      return {'nodes': nodes, 'alignedChapters': aligned};
+      final sliced = parseParagraphsAndSlices(fullContent, rawChapters, splitMode, mergeMinChars);
+      final List<BookParagraph> paragraphs = sliced['paragraphs'] as List<BookParagraph>;
+      final List<TextSliceNode> nodes = sliced['nodes'] as List<TextSliceNode>;
+      final List<BookChapter> aligned = alignChapters(rawChapters, nodes);
+      return {
+        'paragraphs': paragraphs,
+        'nodes': nodes,
+        'alignedChapters': aligned,
+      };
+    });
+  }
+
+  /// 在后台 Isolate 执行全书检索，支持跨句短语匹配并精确映射回切片与自然段索引
+  static Future<List<SearchHit>> searchInIsolate(
+    String fullContent,
+    String query,
+    List<TextSliceNode> nodes,
+    List<BookParagraph> paragraphs, {
+    int maxHits = 2000,
+  }) {
+    return Isolate.run(() {
+      final q = query.trim().toLowerCase();
+      if (q.isEmpty || fullContent.isEmpty || nodes.isEmpty || paragraphs.isEmpty) {
+        return <SearchHit>[];
+      }
+      final lowerContent = fullContent.toLowerCase();
+      final hits = <SearchHit>[];
+      int start = 0;
+      while (hits.length < maxHits) {
+        final idx = lowerContent.indexOf(q, start);
+        if (idx == -1) break;
+        final sliceIdx = findIndexByCharOffset(nodes, idx);
+        final paraIdx = findParagraphIndexByCharOffset(paragraphs, idx);
+        hits.add(SearchHit(charOffset: idx, sliceIndex: sliceIdx, paraIndex: paraIdx));
+        start = idx + max(1, q.length);
+      }
+      return hits;
     });
   }
 
@@ -123,6 +260,9 @@ class BookParser {
   static String _decodeHtmlEntities(String text) {
     var out = text
         .replaceAll('&nbsp;', ' ')
+        .replaceAll('&ensp;', ' ')
+        .replaceAll('&emsp;', '　')
+        .replaceAll('&thinsp;', ' ')
         .replaceAll('&lt;', '<')
         .replaceAll('&gt;', '>')
         .replaceAll('&amp;', '&')
@@ -137,7 +277,13 @@ class BookParser {
         .replaceAll('&ndash;', '–')
         .replaceAll('&hellip;', '…')
         .replaceAll('&middot;', '·')
-        .replaceAll('&copy;', '©');
+        .replaceAll('&bull;', '•')
+        .replaceAll('&times;', '×')
+        .replaceAll('&divide;', '÷')
+        .replaceAll('&deg;', '°')
+        .replaceAll('&copy;', '©')
+        .replaceAll('&reg;', '®')
+        .replaceAll('&trade;', '™');
 
     out = out.replaceAllMapped(RegExp(r'&#x([0-9a-fA-F]+);'), (m) {
       final code = int.tryParse(m.group(1)!, radix: 16);
@@ -151,15 +297,25 @@ class BookParser {
   }
 
   static String stripHtml(String html) {
-    String text = html.replaceAll(RegExp(r'<(script|style|head)\b[^>]*>[\s\S]*?<\/\1>', caseSensitive: false), '');
-    text = text.replaceAll(RegExp(r'<(?:p|div|br|h[1-6]|tr|li|blockquote)\b[^>]*>', caseSensitive: false), '\n');
+    String text = html.replaceAll(RegExp(r'<!--[\s\S]*?-->'), '');
+    text = text.replaceAll(RegExp(r'<(script|style|head)\b[^>]*>[\s\S]*?<\/\1>', caseSensitive: false), '');
+    // 先将 HTML 源码内的物理换行与连续缩进空格折叠为单空格，防止断句碎片化
+    text = text.replaceAll(RegExp(r'[\r\n\t]+'), ' ');
+    text = text.replaceAll(RegExp(r' {2,}'), ' ');
+    // 再将块级元素起始与闭合标签还原为段落换行
+    text = text.replaceAll(
+      RegExp(r'</?(?:p|div|br|h[1-6]|tr|li|blockquote|section|article|header|footer|hr)\b[^>]*>', caseSensitive: false),
+      '\n',
+    );
     text = text.replaceAll(RegExp(r'<[^>]+>'), '');
-    return _decodeHtmlEntities(text);
+    text = _decodeHtmlEntities(text);
+    text = text.replaceAll(RegExp(r' *\n *'), '\n');
+    text = text.replaceAll(RegExp(r'\n{3,}'), '\n\n');
+    return text.trim();
   }
 
   static String cleanMarkdown(String line) {
-    String t = line.replaceAll(RegExp(r'```[\s\S]*?```'), '');
-    t = t.replaceAll(RegExp(r'!\[.*?\]\(.*?\)'), '');
+    String t = line.replaceAll(RegExp(r'!\[.*?\]\(.*?\)'), '');
     t = t.replaceAllMapped(RegExp(r'\[(.*?)\]\(.*?\)'), (m) => m.group(1) ?? '');
     t = t.replaceAll(RegExp(r'(\*\*|__|\*|_|~~|`)'), '');
     t = t.replaceAll(RegExp(r'^\s*>\s*'), '');
@@ -197,9 +353,9 @@ class BookParser {
     return null;
   }
 
-  static Future<Map<String, dynamic>> extractFullTextAndChapters(String filePath) async {
+  static Future<Map<String, dynamic>> extractFullTextAndChapters(String filePath, {String? presetFingerprint}) async {
     final file = File(filePath);
-    final fingerprint = await BookFingerprint.generate(file);
+    final fingerprint = presetFingerprint ?? await BookFingerprint.generate(file);
     final bytes = await file.readAsBytes();
     final fileSize = bytes.length;
     final ext = filePath.split('.').last.toLowerCase();
@@ -228,7 +384,8 @@ class BookParser {
       if (opfPath.isEmpty) throw Exception("未找到 EPUB 描述清单 (OPF)");
 
       final String opfDir = opfPath.contains('/') ? opfPath.substring(0, opfPath.lastIndexOf('/')) : '';
-      final opfFile = archive.firstWhere((f) => f.name.replaceAll('\\', '/') == opfPath);
+      final opfFile = _findArchiveFile(archive, opfPath, opfPath);
+      if (opfFile == null) throw Exception("无法读取 EPUB OPF 清单: $opfPath");
       final opfXml = safeDecode(Uint8List.fromList(opfFile.content as List<int>));
 
       final Map<String, String> manifest = {};
@@ -324,14 +481,21 @@ class BookParser {
         }
       }
 
-      final List<String> spineHrefs = [];
+      final List<String> linearHrefs = [];
+      final List<String> allSpineHrefs = [];
       for (var refMatch in RegExp(r'<itemref\b[^>]*>', caseSensitive: false).allMatches(opfXml)) {
         final tag = refMatch.group(0)!;
         final idrefM = RegExp(r'idref=["\x27]([^"\x27]+)["\x27]', caseSensitive: false).firstMatch(tag);
         if (idrefM != null && manifest.containsKey(idrefM.group(1)!)) {
-          spineHrefs.add(manifest[idrefM.group(1)!]!);
+          final href = manifest[idrefM.group(1)!]!;
+          allSpineHrefs.add(href);
+          final isNonLinear = RegExp(r'linear=["\x27]no["\x27]', caseSensitive: false).hasMatch(tag);
+          if (!isNonLinear) {
+            linearHrefs.add(href);
+          }
         }
       }
+      final spineHrefs = linearHrefs.isNotEmpty ? linearHrefs : allSpineHrefs;
 
       final buffer = StringBuffer();
       for (var href in spineHrefs) {
@@ -352,7 +516,11 @@ class BookParser {
               if (entry.fragmentId != null) {
                 final idMatch = RegExp('id=["\x27]${RegExp.escape(entry.fragmentId!)}["\x27]', caseSensitive: false).firstMatch(rawHtml);
                 if (idMatch != null) {
-                  subOffset = stripHtml(rawHtml.substring(0, idMatch.start)).length;
+                  // 修复锚点半截标签腰斩漏洞：向前回溯到 '<' 之前截取完整标签前缀
+                  final tagStart = rawHtml.lastIndexOf('<', idMatch.start);
+                  final cutPos = tagStart >= 0 ? tagStart : idMatch.start;
+                  final prefixText = stripHtml(rawHtml.substring(0, cutPos));
+                  subOffset = prefixText.isEmpty ? 0 : prefixText.length + 1;
                 }
               }
               chapters.add(BookChapter(
@@ -411,9 +579,26 @@ class BookParser {
       final traditionalChapReg = RegExp(r'^\s*(第[0-9一二三四五六七八九十百千两]+[章卷回节篇部](?:\s+[^\r\n]{0,35}|\s*$))');
 
       final buffer = StringBuffer();
+      bool inCodeBlock = false;
+      String codeFenceChar = '';
+
       for (var line in raw.split('\n')) {
         final String trimmed = line.trim();
         if (trimmed.isEmpty) continue;
+
+        // 状态机过滤多行围栏代码块，避免朗读代码语法
+        if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
+          final fence = trimmed.substring(0, 3);
+          if (!inCodeBlock) {
+            inCodeBlock = true;
+            codeFenceChar = fence;
+          } else if (fence == codeFenceChar) {
+            inCodeBlock = false;
+            codeFenceChar = '';
+          }
+          continue;
+        }
+        if (inCodeBlock) continue;
 
         final hMatch = mdHeadingReg.firstMatch(trimmed);
         if (hMatch != null) {
@@ -437,8 +622,11 @@ class BookParser {
             ));
           }
         }
-        buffer.writeln(cleanMarkdown(trimmed));
-        buffer.writeln();
+        final cleaned = cleanMarkdown(trimmed);
+        if (cleaned.isNotEmpty) {
+          buffer.writeln(cleaned);
+          buffer.writeln();
+        }
       }
       fullContent = buffer.toString();
     } else {
@@ -493,16 +681,35 @@ class BookParser {
 
   static void _emitSafeSlices(List<TextSliceNode> out, String text, int baseStart) {
     if (text.length <= maxSliceChars) {
-      out.add(TextSliceNode(text: text, startOffset: baseStart, endOffset: baseStart + text.length));
+      final trimmed = text.trim();
+      if (trimmed.isNotEmpty && _hasReadableReg.hasMatch(trimmed)) {
+        final lead = text.indexOf(trimmed);
+        out.add(TextSliceNode(
+          text: trimmed,
+          startOffset: baseStart + lead,
+          endOffset: baseStart + lead + trimmed.length,
+        ));
+      }
       return;
     }
 
     int cursor = 0;
     while (cursor < text.length) {
+      while (cursor < text.length && text[cursor] == ' ') {
+        cursor++;
+      }
+      if (cursor >= text.length) break;
+
       if (text.length - cursor <= maxSliceChars) {
-        final tail = text.substring(cursor).trim();
-        if (tail.isNotEmpty) {
-          out.add(TextSliceNode(text: tail, startOffset: baseStart + cursor, endOffset: baseStart + text.length));
+        final rawTail = text.substring(cursor);
+        final tail = rawTail.trim();
+        if (tail.isNotEmpty && _hasReadableReg.hasMatch(tail)) {
+          final lead = rawTail.indexOf(tail);
+          out.add(TextSliceNode(
+            text: tail,
+            startOffset: baseStart + cursor + lead,
+            endOffset: baseStart + cursor + lead + tail.length,
+          ));
         }
         break;
       }
@@ -514,7 +721,7 @@ class BookParser {
         final ch = text[i];
         if ('，,、：:;； '.contains(ch)) {
           cut = i + 1;
-          while (cut < text.length && '”’」』）)'.contains(text[cut])) {
+          while (cut < text.length && '”’」』）)"\''.contains(text[cut])) {
             cut++;
           }
           break;
@@ -522,46 +729,180 @@ class BookParser {
       }
       if (cut == -1) cut = searchLimit;
 
-      final part = text.substring(cursor, cut).trim();
-      if (part.isNotEmpty) {
-        out.add(TextSliceNode(text: part, startOffset: baseStart + cursor, endOffset: baseStart + cut));
+      final rawPart = text.substring(cursor, cut);
+      final part = rawPart.trim();
+      if (part.isNotEmpty && _hasReadableReg.hasMatch(part)) {
+        final lead = rawPart.indexOf(part);
+        out.add(TextSliceNode(
+          text: part,
+          startOffset: baseStart + cursor + lead,
+          endOffset: baseStart + cursor + lead + part.length,
+        ));
       }
       cursor = cut;
-      while (cursor < text.length && text[cursor] == ' ') {
-        cursor++;
-      }
     }
   }
 
-  static List<TextSliceNode> sliceContent(String fullContent, String splitMode) {
-    final nodes = <TextSliceNode>[];
-    if (fullContent.isEmpty) return nodes;
+  /// 支持中英文、日韩等国际化标点与缩写/小数识别的线性句子切分器
+  static void _splitParagraphIntoSentences(String paraText, int paraStartOffset, List<TextSliceNode> out) {
+    final len = paraText.length;
+    int sentStart = 0;
+    int i = 0;
 
-    final hasReadable = RegExp(r'[\w\u4e00-\u9fa5]');
+    bool isClosingQuoteOrParen(String ch) => '”’」』）)"\']】》'.contains(ch);
+    bool isDigit(int code) => code >= 48 && code <= 57;
+    bool isAsciiLetter(int code) => (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 
-    if (splitMode == 'paragraph') {
-      final matches = RegExp(r'[^\r\n]+(?:\r?\n[^\r\n]+)*').allMatches(fullContent);
-      for (final m in matches) {
-        final raw = m.group(0) ?? '';
-        final trimmed = raw.split('\n').map((l) => l.trim()).where((l) => l.isNotEmpty).join(' ');
-        if (trimmed.isNotEmpty && hasReadable.hasMatch(trimmed)) {
-          _emitSafeSlices(nodes, trimmed, m.start);
+    while (i < len) {
+      final ch = paraText[i];
+      bool isSentenceEnd = false;
+
+      if ('。！？；!?;\u2026'.contains(ch)) {
+        // 连续省略号 …… 或 !? 连用视为一个边界
+        while (i + 1 < len && '。！？；!?;\u2026'.contains(paraText[i + 1])) {
+          i++;
+        }
+        isSentenceEnd = true;
+      } else if (ch == '.') {
+        // 英文句号：排除小数 3.14、省略号 ... 中间点、常见缩写 Mr. 等
+        final prevCode = i > 0 ? paraText.codeUnitAt(i - 1) : 0;
+        final nextCode = i + 1 < len ? paraText.codeUnitAt(i + 1) : 0;
+
+        if (i + 1 < len && paraText[i + 1] == '.') {
+          // 英文省略号 ...
+          while (i + 1 < len && paraText[i + 1] == '.') {
+            i++;
+          }
+          isSentenceEnd = true;
+        } else if (isDigit(prevCode) && isDigit(nextCode)) {
+          isSentenceEnd = false;
+        } else if (isAsciiLetter(nextCode) || isDigit(nextCode)) {
+          // 例: example.com / a.b / U.S.A
+          isSentenceEnd = false;
+        } else {
+          // 检查前导单词是否为常见缩写 (Mr. / Dr. / No. / 单字母缩写等)
+          int wordStart = i - 1;
+          while (wordStart >= 0 && isAsciiLetter(paraText.codeUnitAt(wordStart))) {
+            wordStart--;
+          }
+          final prevWord = paraText.substring(wordStart + 1, i).toLowerCase();
+          final isAbbrev = prevWord.length == 1 || _englishAbbreviations.contains(prevWord);
+          final followedBySpaceOrEnd = i + 1 >= len || paraText[i + 1] == ' ' || isClosingQuoteOrParen(paraText[i + 1]);
+          if (!isAbbrev && followedBySpaceOrEnd) {
+            isSentenceEnd = true;
+          }
         }
       }
-    } else {
-      final matches = RegExp(r'[^。！？；?!;\r\n]+(?:[。！？；?!;]+[”’」』）\)]*|\r?\n+)?').allMatches(fullContent);
-      for (final m in matches) {
-        final trimmed = m.group(0)?.trim() ?? '';
-        if (trimmed.isNotEmpty && hasReadable.hasMatch(trimmed)) {
-          _emitSafeSlices(nodes, trimmed, m.start);
+
+      if (isSentenceEnd) {
+        int endPos = i + 1;
+        while (endPos < len && isClosingQuoteOrParen(paraText[endPos])) {
+          endPos++;
         }
+        final seg = paraText.substring(sentStart, endPos);
+        _emitSafeSlices(out, seg, paraStartOffset + sentStart);
+        sentStart = endPos;
+        while (sentStart < len && paraText[sentStart] == ' ') {
+          sentStart++;
+        }
+        i = sentStart;
+        continue;
+      }
+      i++;
+    }
+
+    if (sentStart < len) {
+      final tail = paraText.substring(sentStart);
+      _emitSafeSlices(out, tail, paraStartOffset + sentStart);
+    }
+  }
+
+  /// 同时产出自然段列表 (UI 渲染) 与智能合并后的 TTS 切片列表 (朗读/缓存/导出)
+  static Map<String, dynamic> parseParagraphsAndSlices(
+    String fullContent,
+    List<BookChapter> rawChapters,
+    String splitMode,
+    int mergeMinChars,
+  ) {
+    final paragraphs = <BookParagraph>[];
+    final rawUnits = <TextSliceNode>[];
+
+    if (fullContent.isEmpty) {
+      return {'paragraphs': paragraphs, 'nodes': rawUnits};
+    }
+
+    // 1. 提取自然段（保留在 fullContent 中的精确字符偏移）
+    for (final m in RegExp(r'[^\r\n]+').allMatches(fullContent)) {
+      final rawLine = m.group(0) ?? '';
+      final trimmed = rawLine.trim();
+      if (trimmed.isEmpty || !_hasReadableReg.hasMatch(trimmed)) continue;
+
+      final lead = rawLine.indexOf(trimmed);
+      final pStart = m.start + lead;
+      final pEnd = pStart + trimmed.length;
+      paragraphs.add(BookParagraph(text: trimmed, startOffset: pStart, endOffset: pEnd));
+
+      if (splitMode == 'paragraph') {
+        _emitSafeSlices(rawUnits, trimmed, pStart);
+      } else {
+        _splitParagraphIntoSentences(trimmed, pStart, rawUnits);
       }
     }
 
-    if (nodes.isEmpty && fullContent.trim().isNotEmpty) {
-      nodes.add(TextSliceNode(text: fullContent.trim(), startOffset: 0, endOffset: fullContent.length));
+    if (paragraphs.isEmpty && fullContent.trim().isNotEmpty) {
+      final t = fullContent.trim();
+      final lead = fullContent.indexOf(t);
+      paragraphs.add(BookParagraph(text: t, startOffset: lead, endOffset: lead + t.length));
+      rawUnits.add(TextSliceNode(text: t, startOffset: lead, endOffset: lead + t.length));
     }
-    return nodes;
+
+    // 2. 智能合并短句 (将长度小于 mergeMinChars 的连续短句合并成 >= mergeMinChars 的长句，不跨越章节边界)
+    if (mergeMinChars <= 0 || rawUnits.length <= 1) {
+      return {'paragraphs': paragraphs, 'nodes': rawUnits};
+    }
+
+    final chapOffsets = rawChapters.map((c) => c.charOffset).toList()..sort();
+    final merged = <TextSliceNode>[];
+
+    String curText = rawUnits.first.text;
+    int curStart = rawUnits.first.startOffset;
+    int curEnd = rawUnits.first.endOffset;
+    int chapPtr = 0;
+
+    while (chapPtr < chapOffsets.length && chapOffsets[chapPtr] <= curStart) {
+      chapPtr++;
+    }
+
+    for (int i = 1; i < rawUnits.length; i++) {
+      final next = rawUnits[i];
+
+      bool crossesChapter = false;
+      while (chapPtr < chapOffsets.length && chapOffsets[chapPtr] <= next.startOffset) {
+        if (chapOffsets[chapPtr] > curStart) {
+          crossesChapter = true;
+        }
+        chapPtr++;
+      }
+
+      final bool needMoreChars = curText.length < mergeMinChars;
+      final bool fitsMaxLimit = (curText.length + 1 + next.text.length) <= maxSliceChars;
+
+      if (!crossesChapter && needMoreChars && fitsMaxLimit) {
+        curText = '$curText ${next.text}';
+        curEnd = next.endOffset;
+      } else {
+        merged.add(TextSliceNode(text: curText, startOffset: curStart, endOffset: curEnd));
+        curText = next.text;
+        curStart = next.startOffset;
+        curEnd = next.endOffset;
+        while (chapPtr < chapOffsets.length && chapOffsets[chapPtr] <= curStart) {
+          chapPtr++;
+        }
+      }
+    }
+    merged.add(TextSliceNode(text: curText, startOffset: curStart, endOffset: curEnd));
+
+    return {'paragraphs': paragraphs, 'nodes': merged};
   }
 
   static int findIndexByCharOffset(List<TextSliceNode> nodes, int targetOffset) {
@@ -576,6 +917,27 @@ class BookParser {
     while (low <= high) {
       final int mid = (low + high) ~/ 2;
       if (nodes[mid].startOffset <= targetOffset) {
+        result = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    return result;
+  }
+
+  static int findParagraphIndexByCharOffset(List<BookParagraph> paragraphs, int targetOffset) {
+    if (paragraphs.isEmpty) return 0;
+    if (targetOffset <= paragraphs.first.startOffset) return 0;
+    if (targetOffset >= paragraphs.last.startOffset) return paragraphs.length - 1;
+
+    int low = 0;
+    int high = paragraphs.length - 1;
+    int result = 0;
+
+    while (low <= high) {
+      final int mid = (low + high) ~/ 2;
+      if (paragraphs[mid].startOffset <= targetOffset) {
         result = mid;
         low = mid + 1;
       } else {
