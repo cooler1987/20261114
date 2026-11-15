@@ -73,6 +73,12 @@ String formatFileSize(int bytes) {
   return '${(bytes / pow(1024, i)).toStringAsFixed(1)} ${suffixes[i]}';
 }
 
+String normalizeEngineNetworkMode(String? raw) {
+  if (raw == 'system' || raw == 'proxy') return 'system';
+  if (raw == 'custom') return 'custom';
+  return 'direct';
+}
+
 // ────────────────── 自定义 TTS 引擎模型 ──────────────────
 class CustomTtsEngineConfig {
   final String id;
@@ -85,7 +91,8 @@ class CustomTtsEngineConfig {
   String jsonPath; // 例: choices[0].message.audio.data 或 data.audio
   String apiKey;
   Map<String, String> voices; // voiceId -> displayName
-  String networkMode; // 'direct' (默认) | 'proxy'
+  String networkMode; // 'direct' (默认) | 'system' | 'custom'
+  String customProxy; // 当 networkMode == 'custom' 时生效，如 127.0.0.1:7890 或 7890
 
   CustomTtsEngineConfig({
     required this.id,
@@ -99,6 +106,7 @@ class CustomTtsEngineConfig {
     this.apiKey = '',
     Map<String, String>? voices,
     this.networkMode = 'direct',
+    this.customProxy = '',
   })  : headers = headers ?? {'Content-Type': 'application/json'},
         voices = (voices == null || voices.isEmpty) ? {'default': '默认音色'} : voices;
 
@@ -114,6 +122,7 @@ class CustomTtsEngineConfig {
         'apiKey': apiKey,
         'voices': voices,
         'networkMode': networkMode,
+        'customProxy': customProxy,
       };
 
   factory CustomTtsEngineConfig.fromJson(Map<String, dynamic> json) {
@@ -127,7 +136,7 @@ class CustomTtsEngineConfig {
     if (rawVoices is Map) {
       rawVoices.forEach((k, v) => voicesMap[k.toString()] = v.toString());
     }
-    final netMode = json['networkMode']?.toString() == 'proxy' ? 'proxy' : 'direct';
+    final netMode = normalizeEngineNetworkMode(json['networkMode']?.toString());
     return CustomTtsEngineConfig(
       id: (json['id'] as String?)?.isNotEmpty == true ? json['id'] as String : 'custom_${DateTime.now().millisecondsSinceEpoch}',
       name: (json['name'] as String?)?.isNotEmpty == true ? json['name'] as String : '自定义TTS引擎',
@@ -140,6 +149,7 @@ class CustomTtsEngineConfig {
       apiKey: json['apiKey'] as String? ?? '',
       voices: voicesMap.isEmpty ? {'default': '默认音色'} : voicesMap,
       networkMode: netMode,
+      customProxy: json['customProxy'] as String? ?? '',
     );
   }
 
@@ -158,6 +168,7 @@ class CustomTtsEngineConfig {
       apiKey: apiKey,
       voices: Map<String, String>.from(voices),
       networkMode: networkMode,
+      customProxy: customProxy,
     );
   }
 }
@@ -316,7 +327,6 @@ class MemoryAudioSource extends StreamAudioSource {
   }
 }
 
-/// 剥离 MP3 头部的 ID3v2 与尾部的 128 字节 ID3v1，避免拼接产生爆音或杂音
 Uint8List stripId3Tags(Uint8List data) {
   int start = 0;
   int end = data.length;
