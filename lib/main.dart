@@ -95,7 +95,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   int _maxCacheCount = 100;
   bool _followAlong = true;
   String _splitMode = 'sentence';
-  double _fontSize = 14.0; // 默认 14px，设置页 10-20px 可调
+  double _fontSize = 14.0; // 默认 14px，10-20px 设置页调节
 
   String _lastBookDir = "";
   String _lastBackupDir = StorageHelper.getDefaultBackupDir();
@@ -199,7 +199,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       await session.configure(const AudioSessionConfiguration.speech());
       _noisySub = session.becomingNoisyEventStream.listen((_) {
         if (_isPlaying) {
-          AppLogger.log("检测到耳机拔出或音频输出切换，自动暂停朗读");
+          AppLogger.log("检测到耳机拔出或音频输出切换，自动暂停朗读", null, null, true);
           _stopTTS();
         }
       });
@@ -231,21 +231,30 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     _exportThreads = (prefs.getInt('exportThreads') ?? 6).clamp(1, 16);
     _intervalPauseMs = (prefs.getInt('intervalPauseMs') ?? 200).clamp(0, 1500);
     _maxCacheCount = (prefs.getInt('maxCacheCount') ?? 100).clamp(50, 300);
-    _networkRouter.proxyMode = prefs.getString('proxyMode') == 'manual' ? 'manual' : 'auto';
-    _networkRouter.customProxy = prefs.getString('customProxy') ?? '';
     _followAlong = prefs.getBool('followAlong') ?? true;
     _splitMode = prefs.getString('splitMode') ?? 'sentence';
     _fontSize = (prefs.getDouble('font_size_v2') ?? 14.0).clamp(10.0, 20.0);
-    AppLogger.logLevel = prefs.getString('log_level') ?? 'error';
+    AppLogger.logLevel = AppLogger.normalizeLevel(prefs.getString('log_level'));
 
+    // 分引擎 3 态网络路由 + 自定义代理端口
     final rawRoutes = prefs.getString('engine_network_modes');
     if (rawRoutes != null) {
       try {
         final Map<String, dynamic> decoded = jsonDecode(rawRoutes);
-        decoded.forEach((k, v) => _networkRouter.setEngineRoute(k, v.toString()));
+        decoded.forEach((k, v) => _networkRouter.setEngineNetwork(k, v.toString()));
+      } catch (_) {}
+    }
+    final rawProxies = prefs.getString('engine_custom_proxies');
+    if (rawProxies != null) {
+      try {
+        final Map<String, dynamic> decoded = jsonDecode(rawProxies);
+        decoded.forEach((k, v) {
+          _networkRouter.setEngineNetwork(k, _networkRouter.getEngineRoute(k), v.toString());
+        });
       } catch (_) {}
     }
 
+    // 自定义 TTS 引擎列表
     final rawCustom = prefs.getString('custom_tts_engines_v1');
     if (rawCustom != null) {
       try {
@@ -295,7 +304,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       _history = {};
     }
 
-    _networkRouter.refreshProxy();
+    _networkRouter.refreshSystemProxy();
     _fishTts = FishAudioTTS(apiKey: _apiKey, voices: _userFishVoices, model: _fishModel);
   }
 
@@ -340,9 +349,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     await prefs.setInt('exportThreads', _exportThreads);
     await prefs.setInt('intervalPauseMs', _intervalPauseMs);
     await prefs.setInt('maxCacheCount', _maxCacheCount);
-    await prefs.setString('proxyMode', _networkRouter.proxyMode);
-    await prefs.setString('customProxy', _networkRouter.customProxy);
     await prefs.setString('engine_network_modes', jsonEncode(_networkRouter.engineNetworkModes));
+    await prefs.setString('engine_custom_proxies', jsonEncode(_networkRouter.engineCustomProxies));
     await prefs.setString('custom_tts_engines_v1', jsonEncode(_customEngines.map((e) => e.toJson()).toList()));
     await prefs.setBool('followAlong', _followAlong);
     await prefs.setString('splitMode', _splitMode);
@@ -473,7 +481,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     final List<BookChapter> aligned = res['alignedChapters'];
     final int newIndex = BookParser.findIndexByCharOffset(newNodes, currentAnchorOffset);
 
-    AppLogger.log("切换断句规则: $newMode [锚点: $currentAnchorOffset -> 新项: #$newIndex/${newNodes.length}]");
+    AppLogger.log("切换断句规则: $newMode [锚点: $currentAnchorOffset -> 新项: #$newIndex/${newNodes.length}]", null, null, true);
 
     if (!mounted) return;
     setState(() {
@@ -527,7 +535,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         startIdx = BookParser.findIndexByCharOffset(nodes, saved.charOffset);
       }
 
-      AppLogger.log("电子书装载成功: $name [大小: ${formatFileSize(size)}, 章节: ${rawChapters.length}, 切片: ${nodes.length}, 断点: #$startIdx]");
+      AppLogger.log("电子书装载成功: $name [大小: ${formatFileSize(size)}, 章节: ${rawChapters.length}, 切片: ${nodes.length}, 断点: #$startIdx]", null, null, true);
 
       if (!mounted) return;
       setState(() {
@@ -628,7 +636,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   void _startTTS() {
     if (_nodes.isEmpty) return;
     _playSessionId++;
-    AppLogger.log("朗读启动 [会话: #$_playSessionId, 项: #$_currentIndex, 引擎: $_currentEngine, 音色: $_selectedVoiceId, 语速: ${_speechRate}x]");
+    AppLogger.log("朗读启动 [会话: #$_playSessionId, 项: #$_currentIndex, 引擎: $_currentEngine, 音色: $_selectedVoiceId, 语速: ${_speechRate}x]", null, null, true);
     setState(() {
       _isPlaying = true;
       _isBuffering = true;
@@ -639,7 +647,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
 
   Future<void> _stopTTS() async {
     _playSessionId++;
-    AppLogger.log("朗读停止 [会话: #$_playSessionId]");
+    AppLogger.log("朗读停止 [会话: #$_playSessionId]", null, null, true);
     if (mounted) {
       setState(() {
         _isPlaying = false;
@@ -692,7 +700,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       if (_sleepStopAfterChapter && _alignedChapters.isNotEmpty) {
         for (var c in _alignedChapters) {
           if (c.paragraphIndex == _currentIndex && _currentIndex != 0) {
-            AppLogger.log("已达章节末尾，触发章节定时停止: ${c.title}");
+            AppLogger.log("已达章节末尾，触发章节定时停止: ${c.title}", null, null, true);
             await _stopTTS();
             if (mounted) {
               setState(() => _sleepStopAfterChapter = false);
@@ -728,9 +736,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       }
 
       if (myId != _playSessionId) break;
-      if (epochAtStart != _cacheEpoch) {
-        continue;
-      }
+      if (epochAtStart != _cacheEpoch) continue;
 
       _schedulePrefetchFrom(_currentIndex, _cacheEpoch);
 
@@ -759,7 +765,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       if (myId != _playSessionId) break;
 
       if (_currentIndex + 1 >= _nodes.length) {
-        AppLogger.log("全书朗读完毕");
+        AppLogger.log("全书朗读完毕", null, null, true);
         await _stopTTS();
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('🎉 已读完全书')));
         break;
@@ -856,6 +862,45 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     return Text.rich(TextSpan(style: baseStyle, children: spans));
   }
 
+  // ────────── 容错类型解析工具，确保备份恢复绝不因字段类型偏差丢失数据 ──────────
+  int _parseInt(dynamic val, int fallback) {
+    if (val is int) return val;
+    if (val is num) return val.toInt();
+    if (val is String) return int.tryParse(val.trim()) ?? double.tryParse(val.trim())?.toInt() ?? fallback;
+    return fallback;
+  }
+
+  double _parseDouble(dynamic val, double fallback) {
+    if (val is double) return val;
+    if (val is num) return val.toDouble();
+    if (val is String) return double.tryParse(val.trim()) ?? fallback;
+    return fallback;
+  }
+
+  bool _parseBool(dynamic val, bool fallback) {
+    if (val is bool) return val;
+    if (val is String) {
+      final l = val.trim().toLowerCase();
+      if (l == 'true' || l == '1') return true;
+      if (l == 'false' || l == '0') return false;
+    }
+    if (val is num) return val != 0;
+    return fallback;
+  }
+
+  Map<String, String> _parseStringMap(dynamic raw) {
+    final result = <String, String>{};
+    if (raw is Map) {
+      raw.forEach((k, v) {
+        if (k != null && v != null) {
+          result[k.toString()] = v.toString();
+        }
+      });
+    }
+    return result;
+  }
+
+  // ────────── 完整备份导出 ──────────
   Future<void> _exportBackup() async {
     try {
       if (!await StorageHelper.checkAndRequestManagePermission()) return;
@@ -866,7 +911,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       final file = File('${targetFolder.path}${Platform.pathSeparator}fish_reader_backup_$dateStr.json');
 
       final data = {
-        'version': 7,
+        'version': 8,
         'engineType': _currentEngine,
         'fishApiKey': _apiKey,
         'fishModel': _fishModel,
@@ -878,9 +923,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         'exportThreads': _exportThreads,
         'intervalPauseMs': _intervalPauseMs,
         'maxCacheCount': _maxCacheCount,
-        'proxyMode': _networkRouter.proxyMode,
-        'customProxy': _networkRouter.customProxy,
         'engineNetworkModes': _networkRouter.engineNetworkModes,
+        'engineCustomProxies': _networkRouter.engineCustomProxies,
         'customEngines': _customEngines.map((e) => e.toJson()).toList(),
         'followAlong': _followAlong,
         'splitMode': _splitMode,
@@ -895,15 +939,15 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         'bookmarks': _bookmarks.map((e) => e.toJson()).toList(),
         'history': _history.map((k, v) => MapEntry(k, v.toJson())),
       };
-      await file.writeAsString(jsonEncode(data), flush: true);
+      await file.writeAsString(const JsonEncoder.withIndent('  ').convert(data), flush: true);
 
-      AppLogger.log("全量备份落盘成功: ${file.path}");
+      AppLogger.log("全量备份落盘成功: ${file.path} [APIKey:${_apiKey.isNotEmpty}, 预读:$_preloadCount, 书架:${_history.length}]", null, null, true);
       if (mounted) {
         showDialog(
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('备份导出成功'),
-            content: Text('全量配置、自定义引擎、书架与书签已成功写入：\n\n${file.path}'),
+            content: Text('全量配置、自定义引擎、网络策略、书架与书签已成功写入：\n\n${file.path}'),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('好'))],
           ),
         );
@@ -914,69 +958,225 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     }
   }
 
-  Future<void> _restoreBackupFromFile(String path) async {
+  // ────────── 完整备份恢复 (全字段兼容性校验 + 立即持久化 + 结果核对) ──────────
+  Future<bool> _restoreBackupFromFile(String path) async {
     try {
+      await StorageHelper.checkAndRequestManagePermission();
       final file = File(path);
-      if (!await file.exists()) return;
-      _lastBackupDir = file.parent.path;
+      if (!await file.exists()) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('备份文件不存在: $path')));
+        return false;
+      }
 
-      final data = jsonDecode(await file.readAsString());
-      if (data is! Map) return;
+      // 避免 Android FilePicker 返回的缓存路径污染真实备份目录
+      final parentPath = file.parent.path;
+      if (!parentPath.contains('/cache/') && !parentPath.contains('file_picker')) {
+        _lastBackupDir = parentPath;
+      }
 
+      final rawJson = await file.readAsString();
+      final decoded = jsonDecode(rawJson);
+      if (decoded is! Map) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('无效的备份文件格式')));
+        return false;
+      }
+      final data = Map<String, dynamic>.from(decoded);
+
+      final String prevSplitMode = _splitMode;
+
+      // 1. 先恢复音色字典与自定义引擎，确保后续校验当前选中引擎与音色不被回退覆盖
+      final restoredFishVoices = _parseStringMap(data['fishVoices'] ?? data['custom_user_fish_voices']);
+      final restoredMsVoices = _parseStringMap(data['msVoices'] ?? data['custom_user_ms_voices']);
+
+      final List<CustomTtsEngineConfig> restoredCustomEngines = [];
+      final rawCustom = data['customEngines'] ?? data['custom_tts_engines_v1'];
+      if (rawCustom is List) {
+        for (final item in rawCustom) {
+          if (item is Map) {
+            restoredCustomEngines.add(CustomTtsEngineConfig.fromJson(Map<String, dynamic>.from(item)));
+          }
+        }
+      }
+
+      // 2. 恢复其它核心标量参数（支持别名兼容）
+      final String restoredEngine = (data['engineType'] ?? _currentEngine).toString();
+      final String restoredApiKey = (data['fishApiKey'] ?? data['apiKey'] ?? data['fish_api_key'] ?? _apiKey).toString().trim();
+      final String rawFishModel = (data['fishModel'] ?? _fishModel).toString();
+      final String restoredFishModel = fishModelOptions.contains(rawFishModel) ? rawFishModel : fishModelOptions.first;
+      final String restoredVoice = (data['selectedVoice'] ?? _selectedVoiceId).toString();
+
+      final double restoredRate = _parseDouble(data['speechRate'], _speechRate).clamp(0.5, 2.5);
+      final int restoredBitrate = _parseInt(data['bitrate'], _bitrate) == 128 ? 128 : 64;
+      final int restoredTimeout = _parseInt(data['timeoutSeconds'], _timeoutSeconds).clamp(20, 120);
+      final int restoredPreload = _parseInt(data['preloadCount'] ?? data['preload_count'], _preloadCount).clamp(1, 15);
+      final int restoredThreads = _parseInt(data['exportThreads'] ?? data['export_threads'], _exportThreads).clamp(1, 16);
+      final int restoredInterval = _parseInt(data['intervalPauseMs'], _intervalPauseMs).clamp(0, 1500);
+      final int restoredMaxCache = _parseInt(data['maxCacheCount'], _maxCacheCount).clamp(50, 300);
+      final bool restoredFollow = _parseBool(data['followAlong'], _followAlong);
+      final String restoredSplit = (data['splitMode'] ?? _splitMode).toString() == 'paragraph' ? 'paragraph' : 'sentence';
+      final double restoredFont = _parseDouble(data['font_size_v2'] ?? data['font_size'] ?? data['fontSize'], _fontSize).clamp(10.0, 20.0);
+      final String restoredLogLevel = AppLogger.normalizeLevel((data['log_level'] ?? data['logLevel'])?.toString());
+
+      // 3. 恢复网络策略 (兼容新版分引擎 3 态 & 旧版全局代理配置)
+      final Map<String, String> restoredRoutes = {'ms': 'direct', 'fish': 'direct'};
+      final Map<String, String> restoredProxies = {};
+
+      final rawNetModes = data['engineNetworkModes'] ?? data['engine_network_modes'];
+      if (rawNetModes is Map) {
+        rawNetModes.forEach((k, v) {
+          restoredRoutes[k.toString()] = normalizeEngineNetworkMode(v?.toString());
+        });
+      } else if (data.containsKey('proxyMode')) {
+        // 迁移老版本全局 proxyMode
+        final oldMode = data['proxyMode']?.toString();
+        final oldCustom = normalizeProxyInput(data['customProxy']?.toString() ?? '');
+        if (oldMode == 'manual' && oldCustom.isNotEmpty) {
+          restoredRoutes['ms'] = 'custom';
+          restoredRoutes['fish'] = 'custom';
+          restoredProxies['ms'] = oldCustom;
+          restoredProxies['fish'] = oldCustom;
+        } else if (oldMode == 'auto') {
+          restoredRoutes['ms'] = 'system';
+          restoredRoutes['fish'] = 'system';
+        }
+      }
+
+      final rawCustomProxies = data['engineCustomProxies'] ?? data['engine_custom_proxies'];
+      if (rawCustomProxies is Map) {
+        rawCustomProxies.forEach((k, v) {
+          final norm = normalizeProxyInput(v?.toString() ?? '');
+          if (norm.isNotEmpty) restoredProxies[k.toString()] = norm;
+        });
+      }
+
+      // 4. 恢复路径、书签与书架历史
+      final String restoredBookDir = (data['lastBookDir'] ?? _lastBookDir).toString();
+      final String restoredBackupDir = (data['lastBackupDir'] ?? _lastBackupDir).toString();
+      final String restoredMp3Dir = (data['lastMp3Dir'] ?? _lastMp3Dir).toString();
+
+      final List<String> restoredPins = (data['pinnedVoices'] is List)
+          ? (data['pinnedVoices'] as List).map((e) => e.toString()).toList()
+          : _pinnedVoiceIds;
+
+      final List<BookBookmark> restoredBookmarks = [];
+      if (data['bookmarks'] is List) {
+        for (final item in (data['bookmarks'] as List)) {
+          if (item is Map) restoredBookmarks.add(BookBookmark.fromJson(Map<String, dynamic>.from(item)));
+        }
+      }
+
+      final Map<String, BookHistoryItem> restoredHistory = {};
+      if (data['history'] is Map) {
+        (data['history'] as Map).forEach((k, v) {
+          if (v is Map) {
+            restoredHistory[k.toString()] = BookHistoryItem.fromJson(Map<String, dynamic>.from(v));
+          }
+        });
+      }
+
+      // 5. 统一写入状态并同步所有底层对象
       setState(() {
-        _currentEngine = data['engineType'] ?? _currentEngine;
-        _apiKey = data['fishApiKey'] ?? _apiKey;
-        _fishModel = data['fishModel'] ?? _fishModel;
-        _selectedVoiceId = data['selectedVoice'] ?? _selectedVoiceId;
-        _speechRate = (data['speechRate'] as num?)?.toDouble() ?? _speechRate;
-        _bitrate = (data['bitrate'] as num?)?.toInt() ?? 64;
-        _timeoutSeconds = (data['timeoutSeconds'] as num?)?.toInt() ?? 60;
-        _preloadCount = (data['preloadCount'] as num?)?.toInt() ?? 3;
-        _exportThreads = (data['exportThreads'] as num?)?.toInt() ?? 6;
-        _intervalPauseMs = (data['intervalPauseMs'] as num?)?.toInt() ?? 200;
-        _maxCacheCount = (data['maxCacheCount'] as num?)?.toInt() ?? 100;
-        _networkRouter.proxyMode = data['proxyMode'] == 'manual' ? 'manual' : 'auto';
-        _networkRouter.customProxy = data['customProxy'] ?? '';
-        _followAlong = data['followAlong'] as bool? ?? true;
-        _splitMode = data['splitMode'] ?? 'sentence';
-        final loadedFont = (data['font_size_v2'] as num?)?.toDouble() ?? (data['font_size'] as num?)?.toDouble() ?? 14.0;
-        _fontSize = loadedFont.clamp(10.0, 20.0);
-        AppLogger.logLevel = data['log_level'] ?? 'error';
-        _lastBookDir = data['lastBookDir'] ?? _lastBookDir;
-        _lastMp3Dir = data['lastMp3Dir'] ?? _lastMp3Dir;
+        if (restoredFishVoices.isNotEmpty) _userFishVoices = restoredFishVoices;
+        if (restoredMsVoices.isNotEmpty) _userMsVoices = restoredMsVoices;
+        _customEngines = restoredCustomEngines;
+        _pinnedVoiceIds = restoredPins;
 
-        if (data['engineNetworkModes'] is Map) {
-          (data['engineNetworkModes'] as Map).forEach((k, v) => _networkRouter.setEngineRoute(k.toString(), v.toString()));
-        }
-        if (data['customEngines'] is List) {
-          _customEngines = (data['customEngines'] as List)
-              .map((e) => CustomTtsEngineConfig.fromJson(Map<String, dynamic>.from(e)))
-              .toList();
-        }
-        if (data['fishVoices'] != null) _userFishVoices = Map<String, String>.from(data['fishVoices']);
-        if (data['msVoices'] != null) _userMsVoices = Map<String, String>.from(data['msVoices']);
-        if (data['pinnedVoices'] != null) _pinnedVoiceIds = List<String>.from(data['pinnedVoices']);
+        _currentEngine = restoredEngine;
+        _apiKey = restoredApiKey;
+        _fishModel = restoredFishModel;
+        _selectedVoiceId = restoredVoice;
 
-        if (data['bookmarks'] is List) {
-          _bookmarks = (data['bookmarks'] as List).map((e) => BookBookmark.fromJson(Map<String, dynamic>.from(e))).toList();
+        _speechRate = restoredRate;
+        _bitrate = restoredBitrate;
+        _timeoutSeconds = restoredTimeout;
+        _preloadCount = restoredPreload;
+        _exportThreads = restoredThreads;
+        _intervalPauseMs = restoredInterval;
+        _maxCacheCount = restoredMaxCache;
+        _followAlong = restoredFollow;
+        _splitMode = restoredSplit;
+        _fontSize = restoredFont;
+        AppLogger.logLevel = restoredLogLevel;
+
+        if (restoredBookDir.isNotEmpty) _lastBookDir = restoredBookDir;
+        if (restoredBackupDir.isNotEmpty && !restoredBackupDir.contains('/cache/')) _lastBackupDir = restoredBackupDir;
+        if (restoredMp3Dir.isNotEmpty) _lastMp3Dir = restoredMp3Dir;
+
+        _bookmarks = restoredBookmarks;
+        if (restoredHistory.isNotEmpty) _history = restoredHistory;
+
+        _networkRouter.engineNetworkModes.clear();
+        _networkRouter.engineCustomProxies.clear();
+        restoredRoutes.forEach((k, v) {
+          _networkRouter.setEngineNetwork(k, v, restoredProxies[k] ?? '');
+        });
+        for (final c in _customEngines) {
+          _networkRouter.setEngineNetwork(c.id, c.networkMode, c.customProxy);
         }
-        if (data['history'] is Map) {
-          _history = (data['history'] as Map).map((k, v) => MapEntry(k.toString(), BookHistoryItem.fromJson(Map<String, dynamic>.from(v as Map))));
-        }
+
+        _fishTts = FishAudioTTS(apiKey: _apiKey, voices: _userFishVoices, model: _fishModel);
         _ensureValidSelectedEngineAndVoice();
         _invalidateAudioCache();
       });
 
-      await _networkRouter.refreshProxy();
-      _fishTts = FishAudioTTS(apiKey: _apiKey, voices: _userFishVoices, model: _fishModel);
+      await _networkRouter.refreshSystemProxy();
       await _saveSettings();
       await _saveHistoryToPrefs(immediate: true);
 
-      AppLogger.log("备份恢复成功: ${_history.length} 本书架, ${_customEngines.length} 自定义引擎");
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('🎉 备份已成功恢复！')));
+      // 若当前已打开书籍且断句模式被备份改变，重新切片定位
+      if (_fullContent.isNotEmpty && prevSplitMode != _splitMode) {
+        final targetOffset = (_nodes.isNotEmpty && _currentIndex < _nodes.length) ? _nodes[_currentIndex].startOffset : 0;
+        final res = await BookParser.resliceInIsolate(_fullContent, _rawChapters, _splitMode);
+        if (mounted) {
+          setState(() {
+            _nodes = res['nodes'];
+            _alignedChapters = res['alignedChapters'];
+            _currentIndex = BookParser.findIndexByCharOffset(_nodes, targetOffset);
+          });
+          _scrollToCurrentCenter(immediate: true, force: true);
+        }
+      }
+
+      AppLogger.log(
+        "备份恢复完成 [引擎:$_currentEngine, APIKey:${_apiKey.isEmpty ? '空' : '已恢复(${_apiKey.length}位)'}, 预读:$_preloadCount句, 字体:${_fontSize}px, 书架:${_history.length}本, 自定义引擎:${_customEngines.length}个, 日志:$AppLogger.logLevel]",
+        null,
+        null,
+        true,
+      );
+
+      if (mounted) {
+        final maskedKey = _apiKey.isEmpty
+            ? '未配置'
+            : (_apiKey.length <= 8 ? '已恢复 (${_apiKey.length}位)' : '${_apiKey.substring(0, 4)}****${_apiKey.substring(_apiKey.length - 4)}');
+        await showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.green),
+                SizedBox(width: 8),
+                Text('备份恢复成功'),
+              ],
+            ),
+            content: Text(
+              '已同步应用并写入本地持久化：\n'
+              '• 当前引擎：${ReaderDialogs.getEngineDisplayName(_currentEngine, _customEngines)}\n'
+              '• Fish API Key：$maskedKey\n'
+              '• 预读缓存：$_preloadCount 句 | 导出线程：$_exportThreads\n'
+              '• 正文字号：${_fontSize.toStringAsFixed(1).replaceAll(".0", "")} px | 日志层级：${AppLogger.logLevel}\n'
+              '• 自定义引擎：${_customEngines.length} 个\n'
+              '• 书架记录：${_history.length} 本 | 书签：${_bookmarks.length} 条',
+              style: const TextStyle(height: 1.5, fontSize: 13),
+            ),
+            actions: [FilledButton(onPressed: () => Navigator.pop(ctx), child: const Text('确定'))],
+          ),
+        );
+      }
+      return true;
     } catch (e, stack) {
-      AppLogger.log("恢复备份失败", e, stack);
+      AppLogger.log("恢复备份失败: $path", e, stack);
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('恢复失败: $e')));
+      return false;
     }
   }
 
@@ -990,6 +1190,9 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       onCustomEnginesChanged: (updated) {
         setState(() {
           _customEngines = updated;
+          for (final c in _customEngines) {
+            _networkRouter.setEngineNetwork(c.id, c.networkMode, c.customProxy);
+          }
           _ensureValidSelectedEngineAndVoice();
           _invalidateAudioCache();
         });
@@ -1007,8 +1210,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     );
   }
 
-  void _showSettingsDialog() {
-    ReaderDialogs.showSettingsDialog(
+  void _openSettingsPage() {
+    ReaderDialogs.openSettingsPage(
       context: context,
       currentEngine: _currentEngine,
       apiKey: _apiKey,
@@ -1019,13 +1222,12 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       exportThreads: _exportThreads,
       intervalPauseMs: _intervalPauseMs,
       maxCacheCount: _maxCacheCount,
-      proxyMode: _networkRouter.proxyMode,
-      customProxy: _networkRouter.customProxy,
-      engineNetworkModes: _networkRouter.engineNetworkModes,
+      networkRouter: _networkRouter,
       customEngines: _customEngines,
       followAlong: _followAlong,
       splitMode: _splitMode,
       fontSize: _fontSize,
+      logLevel: AppLogger.logLevel,
       lastBackupDir: _lastBackupDir,
       onExportBackup: _exportBackup,
       onBackupDirChanged: (d) {
@@ -1048,12 +1250,12 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         required exportThreads,
         required intervalPauseMs,
         required maxCacheCount,
-        required proxyMode,
-        required customProxy,
         required engineNetworkModes,
+        required engineCustomProxies,
         required followAlong,
         required splitMode,
         required fontSize,
+        required logLevel,
       }) async {
         final bool splitChanged = (_splitMode != splitMode);
         final bool audioParamsChanged = (_currentEngine != engine || _bitrate != bitrate || _fishModel != fishModel || _apiKey != apiKey);
@@ -1070,22 +1272,28 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
           _exportThreads = exportThreads;
           _intervalPauseMs = intervalPauseMs;
           _maxCacheCount = maxCacheCount;
-          _networkRouter.proxyMode = proxyMode;
-          _networkRouter.customProxy = customProxy;
-          engineNetworkModes.forEach((k, v) {
-            _networkRouter.setEngineRoute(k, v);
+          AppLogger.logLevel = AppLogger.normalizeLevel(logLevel);
+
+          engineNetworkModes.forEach((k, mode) {
+            final customAddr = engineCustomProxies[k] ?? '';
+            _networkRouter.setEngineNetwork(k, mode, customAddr);
             for (final c in _customEngines) {
-              if (c.id == k) c.networkMode = v == 'proxy' ? 'proxy' : 'direct';
+              if (c.id == k) {
+                c.networkMode = normalizeEngineNetworkMode(mode);
+                c.customProxy = normalizeProxyInput(customAddr);
+              }
             }
           });
+
           _followAlong = followAlong;
           _fontSize = fontSize.clamp(10.0, 20.0);
           _ensureValidSelectedEngineAndVoice();
           if (audioParamsChanged) _invalidateAudioCache();
         });
 
-        await _networkRouter.refreshProxy();
+        await _networkRouter.refreshSystemProxy();
         await _saveSettings();
+        AppLogger.log("系统设置已保存 [引擎:$_currentEngine, 预读:$_preloadCount, 字号:${_fontSize}px, 日志:${AppLogger.logLevel}]", null, null, true);
 
         if (splitChanged) {
           await _switchSplitMode(splitMode);
@@ -1165,13 +1373,13 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
           _sleepStopAfterChapter = false;
           _sleepTimeLeftSeconds = minutes * 60;
         });
-        AppLogger.log("启动睡眠定时: $minutes 分钟倒计时");
+        AppLogger.log("启动睡眠定时: $minutes 分钟倒计时", null, null, true);
         _sleepTimer = Timer.periodic(const Duration(seconds: 1), (t) {
           if (_sleepTimeLeftSeconds > 0) {
             setState(() => _sleepTimeLeftSeconds--);
           } else {
             t.cancel();
-            AppLogger.log("睡眠定时倒计时归零，自动执行暂停");
+            AppLogger.log("睡眠定时倒计时归零，自动执行暂停", null, null, true);
             _stopTTS();
           }
         });
@@ -1189,7 +1397,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
           _sleepStopAfterChapter = true;
           _sleepTimeLeftSeconds = 0;
         });
-        AppLogger.log("设定为: 读完本章后自动暂停");
+        AppLogger.log("设定为: 读完本章后自动暂停", null, null, true);
       },
     );
   }
@@ -1225,15 +1433,28 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     );
   }
 
+  String _describeEngineRoute(String engId) {
+    final route = _networkRouter.getEngineRoute(engId, _customEngines);
+    if (route == 'system') {
+      final sys = _networkRouter.detectedSystemProxy;
+      return sys != null && sys.isNotEmpty ? '系统代理($sys)' : '系统代理(未检测到-回退直连)';
+    }
+    if (route == 'custom') {
+      final custom = _networkRouter.getEngineCustomProxy(engId, _customEngines);
+      return custom.isNotEmpty ? '自定义代理($custom)' : '自定义代理(未填写-回退直连)';
+    }
+    return '直连';
+  }
+
   Future<void> _runConnectivityDiagnostics() async {
     showDialog(context: context, barrierDismissible: false, builder: (_) => const Center(child: CircularProgressIndicator()));
-    await _networkRouter.refreshProxy();
+    await _networkRouter.refreshSystemProxy();
     final msRes = await MicrosoftTranslatorTTS.testConnectivity(_networkRouter.getClientForEngine('ms', _customEngines));
     final fishRes = await _fishTts.testConnectivity(_networkRouter.getClientForEngine('fish', _customEngines));
     final customResults = <Map<String, dynamic>>[];
     for (final c in _customEngines) {
       final r = await CustomTtsRunner.testConnectivity(c, _networkRouter.getClientForEngine(c.id, _customEngines));
-      customResults.add({'name': c.name, 'route': c.networkMode, ...r});
+      customResults.add({'id': c.id, 'name': c.name, ...r});
     }
     if (!mounted) return;
     Navigator.pop(context);
@@ -1247,14 +1468,14 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text("微软官方 [${_networkRouter.getEngineRoute('ms') == 'proxy' ? '走代理' : '直连'}]: ${msRes['success'] ? '✅ 畅通' : '❌ 异常'} (${msRes['latency']}ms)"),
+              Text("微软官方 [${_describeEngineRoute('ms')}]: ${msRes['success'] ? '✅ 畅通' : '❌ 异常'} (${msRes['latency']}ms)"),
               Text("详情: ${msRes['msg']}", style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
               const Divider(),
-              Text("Fish Audio [${_networkRouter.getEngineRoute('fish') == 'proxy' ? '走代理' : '直连'}]: ${fishRes['success'] ? '✅ 畅通' : '❌ 异常'} (${fishRes['latency']}ms)"),
+              Text("Fish Audio [${_describeEngineRoute('fish')}]: ${fishRes['success'] ? '✅ 畅通' : '❌ 异常'} (${fishRes['latency']}ms)"),
               Text("详情: ${fishRes['msg']}", style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
               for (final cr in customResults) ...[
                 const Divider(),
-                Text("🧩 ${cr['name']} [${cr['route'] == 'proxy' ? '走代理' : '直连'}]: ${cr['success'] ? '✅ 畅通' : '❌ 异常'} (${cr['latency']}ms)"),
+                Text("🧩 ${cr['name']} [${_describeEngineRoute(cr['id'])}]: ${cr['success'] ? '✅ 畅通' : '❌ 异常'} (${cr['latency']}ms)"),
                 Text("详情: ${cr['msg']}", style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
               ],
             ],
@@ -1276,7 +1497,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     final String currentEngineLabel = _currentEngine == 'ms'
         ? '微软'
         : (_currentEngine == 'fish' ? 'Fish' : ReaderDialogs.getEngineDisplayName(_currentEngine, _customEngines));
-    final bool isDirectNet = _networkRouter.getEngineRoute(_currentEngine, _customEngines) == 'direct';
+    final String activeRoute = _networkRouter.getEngineRoute(_currentEngine, _customEngines);
 
     return PopScope(
       canPop: false,
@@ -1461,10 +1682,17 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
                   onSelected: (val) async {
                     switch (val) {
                       case "settings":
-                        _showSettingsDialog();
+                        _openSettingsPage();
                         break;
                       case "custom_engines":
                         await _openCustomEnginesManager();
+                        break;
+                      case "restore":
+                        await ReaderDialogs.showRestorePicker(
+                          context: context,
+                          lastBackupDir: _lastBackupDir,
+                          onRestoreFile: _restoreBackupFromFile,
+                        );
                         break;
                       case "network":
                         await _runConnectivityDiagnostics();
@@ -1473,15 +1701,16 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
                         ReaderDialogs.showLogViewerDialog(
                           context: context,
                           onLogLevelChanged: (newLevel) {
-                            widget.prefs.setString('log_level', newLevel);
+                            widget.prefs.setString('log_level', AppLogger.normalizeLevel(newLevel));
                           },
                         );
                         break;
                     }
                   },
                   itemBuilder: (_) => [
-                    const PopupMenuItem(value: "settings", child: Row(children: [Icon(Icons.settings, color: Colors.blue), SizedBox(width: 8), Text("系统、字体与规则设置")])),
+                    const PopupMenuItem(value: "settings", child: Row(children: [Icon(Icons.settings, color: Colors.blue), SizedBox(width: 8), Text("系统、字体与网络设置")])),
                     const PopupMenuItem(value: "custom_engines", child: Row(children: [Icon(Icons.extension, color: Color(0xFFC87D2E)), SizedBox(width: 8), Text("自定义 TTS 引擎管理")])),
+                    const PopupMenuItem(value: "restore", child: Row(children: [Icon(Icons.settings_backup_restore, color: Colors.deepOrange), SizedBox(width: 8), Text("从备份文件恢复")])),
                     const PopupMenuItem(value: "network", child: Row(children: [Icon(Icons.wifi_find, color: Colors.teal), SizedBox(width: 8), Text("全引擎连通性诊断")])),
                     const PopupMenuItem(value: "logs", child: Row(children: [Icon(Icons.terminal, color: Color(0xFFC87D2E)), SizedBox(width: 8), Text("运行日志管理")])),
                   ],
@@ -1718,7 +1947,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
               isPlaying: _isPlaying,
               isBuffering: _isBuffering,
               followAlong: _followAlong,
-              isDirectNetwork: isDirectNet,
+              networkRoute: activeRoute,
               onVoiceTap: _showVoiceManagerDialog,
               onSpeedTap: () {
                 final int nextIdx = (speedOptions.indexOf(_speechRate) + 1) % speedOptions.length;
