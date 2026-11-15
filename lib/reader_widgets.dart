@@ -6,9 +6,10 @@ import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import 'models.dart';
 
-// ────────────────── 1. 微信读书质感底部悬浮播控仓 (支持 3 态网络图标标识) ──────────────────
+// ────────────────── 1. 微信读书质感底部悬浮播控仓 (精简按钮 + 主题适配 + 章节/余时预估) ──────────────────
 class WeReadPlayerBar extends StatelessWidget {
   final bool isWide;
+  final ReaderThemeConfig theme;
   final String engineLabel;
   final String voiceName;
   final double speechRate;
@@ -16,6 +17,7 @@ class WeReadPlayerBar extends StatelessWidget {
   final bool sleepStopAfterChapter;
   final int currentIndex;
   final int totalNodes;
+  final String? progressSubInfo;
   final bool isPlaying;
   final bool isBuffering;
   final bool followAlong;
@@ -26,15 +28,13 @@ class WeReadPlayerBar extends StatelessWidget {
   final VoidCallback onSleepTimerTap;
   final ValueChanged<int> onSeek;
   final VoidCallback onOpenDrawer;
-  final VoidCallback onPrev;
   final VoidCallback onPlayPause;
-  final VoidCallback onNext;
   final VoidCallback onToggleFollowAlong;
-  final VoidCallback onExportTap;
 
   const WeReadPlayerBar({
     super.key,
     required this.isWide,
+    required this.theme,
     required this.engineLabel,
     required this.voiceName,
     required this.speechRate,
@@ -42,6 +42,7 @@ class WeReadPlayerBar extends StatelessWidget {
     required this.sleepStopAfterChapter,
     required this.currentIndex,
     required this.totalNodes,
+    this.progressSubInfo,
     required this.isPlaying,
     required this.isBuffering,
     required this.followAlong,
@@ -51,11 +52,8 @@ class WeReadPlayerBar extends StatelessWidget {
     required this.onSleepTimerTap,
     required this.onSeek,
     required this.onOpenDrawer,
-    required this.onPrev,
     required this.onPlayPause,
-    required this.onNext,
     required this.onToggleFollowAlong,
-    required this.onExportTap,
   });
 
   IconData _routeIcon() {
@@ -78,10 +76,10 @@ class WeReadPlayerBar extends StatelessWidget {
       margin: EdgeInsets.symmetric(horizontal: isWide ? 28 : 12, vertical: 8),
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       decoration: BoxDecoration(
-        color: const Color(0xFFFCFBF7),
+        color: theme.surfaceBg,
         borderRadius: BorderRadius.circular(22),
-        border: Border.all(color: const Color(0xFFE5E2D9), width: 1),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 14, offset: const Offset(0, 4))],
+        border: Border.all(color: theme.cardBorder, width: 1),
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(theme.brightness == Brightness.dark ? 0.35 : 0.07), blurRadius: 14, offset: const Offset(0, 4))],
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -94,23 +92,23 @@ class WeReadPlayerBar extends StatelessWidget {
                   borderRadius: BorderRadius.circular(16),
                   child: Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-                    decoration: BoxDecoration(color: const Color(0xFFF3EEE1), borderRadius: BorderRadius.circular(16)),
+                    decoration: BoxDecoration(color: theme.chipBg, borderRadius: BorderRadius.circular(16)),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
                         Tooltip(
                           message: "当前网络连接: ${_routeTag()}",
-                          child: Icon(_routeIcon(), size: 13, color: const Color(0xFFC87D2E)),
+                          child: Icon(_routeIcon(), size: 13, color: theme.accent),
                         ),
                         const SizedBox(width: 5),
                         Flexible(
                           child: Text(
                             "$engineLabel·$voiceName",
-                            style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFF2C3238)),
+                            style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: theme.primaryText),
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                        const Icon(Icons.arrow_drop_down, size: 16, color: Color(0xFFC87D2E)),
+                        Icon(Icons.arrow_drop_down, size: 16, color: theme.accent),
                       ],
                     ),
                   ),
@@ -122,8 +120,8 @@ class WeReadPlayerBar extends StatelessWidget {
                 onTap: onSpeedTap,
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(border: Border.all(color: const Color(0xFFDDD9CD)), borderRadius: BorderRadius.circular(12)),
-                  child: Text("${speechRate}x", style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Color(0xFFC87D2E))),
+                  decoration: BoxDecoration(border: Border.all(color: theme.cardBorder), borderRadius: BorderRadius.circular(12)),
+                  child: Text("${speechRate}x", style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: theme.accent)),
                 ),
               ),
               const SizedBox(width: 6),
@@ -133,9 +131,9 @@ class WeReadPlayerBar extends StatelessWidget {
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(
-                    color: (sleepTimeLeftSeconds > 0 || sleepStopAfterChapter) ? const Color(0xFFEFE7D2) : Colors.transparent,
+                    color: (sleepTimeLeftSeconds > 0 || sleepStopAfterChapter) ? theme.highlightBg : Colors.transparent,
                     border: Border.all(
-                      color: (sleepTimeLeftSeconds > 0 || sleepStopAfterChapter) ? const Color(0xFFC87D2E) : const Color(0xFFDDD9CD),
+                      color: (sleepTimeLeftSeconds > 0 || sleepStopAfterChapter) ? theme.accent : theme.cardBorder,
                     ),
                     borderRadius: BorderRadius.circular(12),
                   ),
@@ -144,14 +142,14 @@ class WeReadPlayerBar extends StatelessWidget {
                       Icon(
                         Icons.bedtime_outlined,
                         size: 13,
-                        color: (sleepTimeLeftSeconds > 0 || sleepStopAfterChapter) ? const Color(0xFFC87D2E) : Colors.grey,
+                        color: (sleepTimeLeftSeconds > 0 || sleepStopAfterChapter) ? theme.accent : theme.secondaryText,
                       ),
                       if (sleepTimeLeftSeconds > 0)
                         Padding(
                           padding: const EdgeInsets.only(left: 4),
                           child: Text(
                             "${sleepTimeLeftSeconds ~/ 60}m",
-                            style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Color(0xFFC87D2E)),
+                            style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: theme.accent),
                           ),
                         ),
                     ],
@@ -160,20 +158,20 @@ class WeReadPlayerBar extends StatelessWidget {
               ),
             ],
           ),
-          if (totalNodes > 0)
+          if (totalNodes > 0) ...[
             Padding(
-              padding: const EdgeInsets.only(top: 4, bottom: 2),
+              padding: const EdgeInsets.only(top: 4),
               child: Row(
                 children: [
-                  Text("${currentIndex + 1}/$totalNodes", style: const TextStyle(fontSize: 10, color: Colors.blueGrey, fontWeight: FontWeight.bold)),
+                  Text("${currentIndex + 1}/$totalNodes", style: TextStyle(fontSize: 10, color: theme.secondaryText, fontWeight: FontWeight.bold)),
                   Expanded(
                     child: SliderTheme(
                       data: SliderTheme.of(context).copyWith(
                         trackHeight: 2.5,
                         thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 5.5),
-                        activeTrackColor: const Color(0xFFC87D2E),
-                        inactiveTrackColor: const Color(0xFFE0DDD5),
-                        thumbColor: const Color(0xFFC87D2E),
+                        activeTrackColor: theme.accent,
+                        inactiveTrackColor: theme.cardBorder,
+                        thumbColor: theme.accent,
                       ),
                       child: Slider(
                         value: progressFraction,
@@ -184,62 +182,62 @@ class WeReadPlayerBar extends StatelessWidget {
                       ),
                     ),
                   ),
-                  Text("${(progressFraction * 100).toStringAsFixed(1)}%", style: const TextStyle(fontSize: 10, color: Colors.blueGrey, fontWeight: FontWeight.bold)),
+                  Text("${(progressFraction * 100).toStringAsFixed(1)}%", style: TextStyle(fontSize: 10, color: theme.secondaryText, fontWeight: FontWeight.bold)),
                 ],
               ),
             ),
+            if (progressSubInfo != null && progressSubInfo!.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 2),
+                child: Text(
+                  progressSubInfo!,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 10, color: theme.secondaryText),
+                ),
+              ),
+          ],
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              IconButton(icon: Icon(isWide ? Icons.menu_open : Icons.menu_book_outlined), tooltip: "目录与书架", onPressed: onOpenDrawer),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(icon: const Icon(Icons.skip_previous_rounded, size: 28), tooltip: "上一项", onPressed: onPrev),
-                  const SizedBox(width: 8),
-                  GestureDetector(
-                    onTap: onPlayPause,
-                    child: Stack(
-                      alignment: Alignment.center,
-                      children: [
-                        Container(
-                          width: 48,
-                          height: 48,
-                          decoration: const BoxDecoration(
-                            color: Color(0xFFC87D2E),
-                            shape: BoxShape.circle,
-                            boxShadow: [BoxShadow(color: Color(0x40C87D2E), blurRadius: 8, offset: Offset(0, 3))],
-                          ),
-                          child: Icon(isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded, color: Colors.white, size: 30),
-                        ),
-                        if (isPlaying && isBuffering)
-                          const SizedBox(
-                            width: 48,
-                            height: 48,
-                            child: CircularProgressIndicator(strokeWidth: 2.2, color: Colors.white70),
-                          ),
-                      ],
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  IconButton(icon: const Icon(Icons.skip_next_rounded, size: 28), tooltip: "下一项", onPressed: onNext),
-                ],
+              IconButton(
+                icon: Icon(isWide ? Icons.menu_open : Icons.menu_book_outlined, color: theme.primaryText),
+                tooltip: "目录与书架",
+                onPressed: onOpenDrawer,
               ),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  IconButton(
-                    icon: Icon(
-                      followAlong ? Icons.vertical_align_center : Icons.vertical_align_bottom_outlined,
-                      color: followAlong ? const Color(0xFFC87D2E) : Colors.grey,
-                      size: 20,
+              GestureDetector(
+                onTap: onPlayPause,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    Container(
+                      width: 48,
+                      height: 48,
+                      decoration: BoxDecoration(
+                        color: theme.accent,
+                        shape: BoxShape.circle,
+                        boxShadow: [BoxShadow(color: theme.accent.withOpacity(0.32), blurRadius: 8, offset: const Offset(0, 3))],
+                      ),
+                      child: Icon(isPlaying ? Icons.pause_rounded : Icons.play_arrow_rounded, color: Colors.white, size: 30),
                     ),
-                    tooltip: followAlong ? "跟读居中: 开" : "跟读居中: 关",
-                    onPressed: onToggleFollowAlong,
-                  ),
-                  IconButton(icon: const Icon(Icons.audio_file_outlined, color: Color(0xFFC87D2E), size: 20), tooltip: "批量导出 MP3", onPressed: onExportTap),
-                ],
-              )
+                    if (isPlaying && isBuffering)
+                      const SizedBox(
+                        width: 48,
+                        height: 48,
+                        child: CircularProgressIndicator(strokeWidth: 2.2, color: Colors.white70),
+                      ),
+                  ],
+                ),
+              ),
+              IconButton(
+                icon: Icon(
+                  followAlong ? Icons.vertical_align_center : Icons.vertical_align_bottom_outlined,
+                  color: followAlong ? theme.accent : theme.secondaryText,
+                  size: 22,
+                ),
+                tooltip: followAlong ? "跟读居中: 开" : "跟读居中: 关",
+                onPressed: onToggleFollowAlong,
+              ),
             ],
           ),
         ],
@@ -248,8 +246,9 @@ class WeReadPlayerBar extends StatelessWidget {
   }
 }
 
-// ────────────────── 2. 抽屉侧边栏 (目录自动定位当前章 + 书架 + 书签) ──────────────────
+// ────────────────── 2. 抽屉侧边栏 (目录自动定位当前章 + 书架 + 书签 + MP3导出入口) ──────────────────
 class ReaderSidebar extends StatefulWidget {
+  final ReaderThemeConfig theme;
   final int sidebarTab;
   final bool isSelectionMode;
   final Set<String> selectedFingerprints;
@@ -257,6 +256,7 @@ class ReaderSidebar extends StatefulWidget {
   final int currentIndex;
   final List<BookHistoryItem> bookList;
   final List<BookBookmark> bookmarks;
+  final bool hasBookLoaded;
 
   final ValueChanged<int> onTabChanged;
   final VoidCallback onToggleSelectionMode;
@@ -266,6 +266,7 @@ class ReaderSidebar extends StatefulWidget {
   final Function(String fp, bool selected) onToggleBookSelection;
   final VoidCallback onSelectAllToggle;
   final VoidCallback onDeleteSelected;
+  final VoidCallback onExportMp3Tap;
 
   final ValueChanged<BookBookmark> onBookmarkSelected;
   final ValueChanged<BookBookmark> onBookmarkEdit;
@@ -273,6 +274,7 @@ class ReaderSidebar extends StatefulWidget {
 
   const ReaderSidebar({
     super.key,
+    required this.theme,
     required this.sidebarTab,
     required this.isSelectionMode,
     required this.selectedFingerprints,
@@ -280,6 +282,7 @@ class ReaderSidebar extends StatefulWidget {
     required this.currentIndex,
     required this.bookList,
     required this.bookmarks,
+    required this.hasBookLoaded,
     required this.onTabChanged,
     required this.onToggleSelectionMode,
     required this.onChapterSelected,
@@ -288,6 +291,7 @@ class ReaderSidebar extends StatefulWidget {
     required this.onToggleBookSelection,
     required this.onSelectAllToggle,
     required this.onDeleteSelected,
+    required this.onExportMp3Tap,
     required this.onBookmarkSelected,
     required this.onBookmarkEdit,
     required this.onBookmarkDelete,
@@ -359,11 +363,12 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = widget.theme;
     final visibleChapterIndices = _computeVisibleIndices();
 
     return Container(
       width: 320,
-      color: const Color(0xFFF0EDE4),
+      color: theme.sidebarBg,
       child: SafeArea(
         child: Column(
           children: [
@@ -374,9 +379,10 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                   Expanded(
                     child: ChoiceChip(
                       padding: EdgeInsets.zero,
-                      label: const Center(child: Text("📑 目录", style: TextStyle(fontSize: 11.5))),
+                      label: Center(child: Text("📑 目录", style: TextStyle(fontSize: 11.5, color: theme.primaryText))),
                       selected: widget.sidebarTab == 0,
-                      selectedColor: Colors.white,
+                      selectedColor: theme.surfaceBg,
+                      backgroundColor: theme.chipBg,
                       onSelected: (_) => widget.onTabChanged(0),
                     ),
                   ),
@@ -384,9 +390,10 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                   Expanded(
                     child: ChoiceChip(
                       padding: EdgeInsets.zero,
-                      label: const Center(child: Text("📚 书架", style: TextStyle(fontSize: 11.5))),
+                      label: Center(child: Text("📚 书架", style: TextStyle(fontSize: 11.5, color: theme.primaryText))),
                       selected: widget.sidebarTab == 1,
-                      selectedColor: Colors.white,
+                      selectedColor: theme.surfaceBg,
+                      backgroundColor: theme.chipBg,
                       onSelected: (_) => widget.onTabChanged(1),
                     ),
                   ),
@@ -394,9 +401,10 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                   Expanded(
                     child: ChoiceChip(
                       padding: EdgeInsets.zero,
-                      label: Center(child: Text("🔖 书签 (${widget.bookmarks.length})", style: const TextStyle(fontSize: 11.5))),
+                      label: Center(child: Text("🔖 书签 (${widget.bookmarks.length})", style: TextStyle(fontSize: 11.5, color: theme.primaryText))),
                       selected: widget.sidebarTab == 2,
-                      selectedColor: Colors.white,
+                      selectedColor: theme.surfaceBg,
+                      backgroundColor: theme.chipBg,
                       onSelected: (_) => widget.onTabChanged(2),
                     ),
                   ),
@@ -409,7 +417,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text("共 ${widget.bookList.length} 本图书", style: const TextStyle(fontSize: 12, color: Colors.blueGrey, fontWeight: FontWeight.bold)),
+                    Text("共 ${widget.bookList.length} 本图书", style: TextStyle(fontSize: 12, color: theme.secondaryText, fontWeight: FontWeight.bold)),
                     TextButton.icon(
                       style: TextButton.styleFrom(visualDensity: VisualDensity.compact, padding: EdgeInsets.zero),
                       icon: Icon(widget.isSelectionMode ? Icons.close : Icons.checklist, size: 16),
@@ -424,7 +432,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                 builder: (context) {
                   if (widget.sidebarTab == 0) {
                     if (widget.chapters.isEmpty) {
-                      return const Center(child: Text("当前图书无大纲目录", style: TextStyle(color: Colors.grey, fontSize: 13)));
+                      return Center(child: Text("当前图书无大纲目录", style: TextStyle(color: theme.secondaryText, fontSize: 13)));
                     }
                     final initialTocIdx = _findActiveDisplayIndex(visibleChapterIndices);
                     return ScrollablePositionedList.builder(
@@ -446,7 +454,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                         final bool isPrimary = level == 0;
 
                         return Container(
-                          color: isCur ? const Color(0xFFE5DFC9) : Colors.transparent,
+                          color: isCur ? theme.highlightBg : Colors.transparent,
                           padding: EdgeInsets.only(left: indentPadding, right: 8),
                           child: Row(
                             children: [
@@ -470,7 +478,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                                       child: Icon(
                                         Icons.keyboard_arrow_down_rounded,
                                         size: 18,
-                                        color: isCur ? const Color(0xFFC87D2E) : Colors.blueGrey,
+                                        color: isCur ? theme.accent : theme.secondaryText,
                                       ),
                                     ),
                                   ),
@@ -481,7 +489,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                                   child: Icon(
                                     Icons.subdirectory_arrow_right_rounded,
                                     size: 13,
-                                    color: isCur ? const Color(0xFFC87D2E) : Colors.blueGrey.shade300,
+                                    color: isCur ? theme.accent : theme.secondaryText.withOpacity(0.55),
                                   ),
                                 )
                               else
@@ -501,9 +509,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                                       overflow: TextOverflow.ellipsis,
                                       style: TextStyle(
                                         fontSize: isPrimary ? 13.5 : 12.5,
-                                        color: isCur
-                                            ? const Color(0xFFC87D2E)
-                                            : (isPrimary ? const Color(0xFF2C3238) : const Color(0xFF555B61)),
+                                        color: isCur ? theme.highlightText : (isPrimary ? theme.primaryText : theme.secondaryText),
                                         fontWeight: isCur ? FontWeight.bold : (isPrimary ? FontWeight.w600 : FontWeight.normal),
                                       ),
                                     ),
@@ -519,7 +525,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
 
                   if (widget.sidebarTab == 1) {
                     if (widget.bookList.isEmpty) {
-                      return const Center(child: Text("书架空空如也\n请在右上角导入图书", textAlign: TextAlign.center, style: TextStyle(color: Colors.grey, fontSize: 13)));
+                      return Center(child: Text("书架空空如也\n请在右上角导入图书", textAlign: TextAlign.center, style: TextStyle(color: theme.secondaryText, fontSize: 13)));
                     }
                     return ListView.builder(
                       itemCount: widget.bookList.length,
@@ -531,11 +537,11 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
 
                         return Card(
                           elevation: isSelected ? 2 : 0.5,
-                          color: isSelected ? const Color(0xFFEFE7D2) : const Color(0xFFFCFBF7),
+                          color: isSelected ? theme.highlightBg : theme.surfaceBg,
                           margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(8),
-                            side: isSelected ? const BorderSide(color: Color(0xFFC87D2E), width: 1.5) : const BorderSide(color: Color(0xFFE9E7DE)),
+                            side: isSelected ? BorderSide(color: theme.accent, width: 1.5) : BorderSide(color: theme.cardBorder),
                           ),
                           child: InkWell(
                             borderRadius: BorderRadius.circular(8),
@@ -581,16 +587,16 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                                             fontWeight: FontWeight.bold,
                                             fontSize: 13,
                                             height: 1.25,
-                                            color: fileExists ? const Color(0xFF2C3238) : Colors.redAccent,
+                                            color: fileExists ? theme.primaryText : Colors.redAccent,
                                           ),
                                         ),
                                         const SizedBox(height: 4),
                                         Row(
                                           children: [
-                                            if (sizeStr.isNotEmpty) Text("$sizeStr · ", style: const TextStyle(fontSize: 10, color: Colors.blueGrey)),
+                                            if (sizeStr.isNotEmpty) Text("$sizeStr · ", style: TextStyle(fontSize: 10, color: theme.secondaryText)),
                                             Text(
                                               "进度: ${(item.percentage * 100).toStringAsFixed(1)}%",
-                                              style: const TextStyle(fontSize: 10, color: Color(0xFFC87D2E), fontWeight: FontWeight.bold),
+                                              style: TextStyle(fontSize: 10, color: theme.accent, fontWeight: FontWeight.bold),
                                             ),
                                             if (!fileExists)
                                               const Padding(
@@ -612,13 +618,13 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                   }
 
                   if (widget.bookmarks.isEmpty) {
-                    return const Center(
+                    return Center(
                       child: Padding(
-                        padding: EdgeInsets.all(24),
+                        padding: const EdgeInsets.all(24),
                         child: Text(
-                          "当前图书暂无书签\n\n在正文长按或右键句子\n即可在此添加书签",
+                          "当前图书暂无书签\n\n在正文长按或右键选择文本\n在菜单中点击「添加书签」即可",
                           textAlign: TextAlign.center,
-                          style: TextStyle(color: Colors.grey, fontSize: 13, height: 1.5),
+                          style: TextStyle(color: theme.secondaryText, fontSize: 13, height: 1.5),
                         ),
                       ),
                     );
@@ -632,11 +638,11 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
 
                       return Card(
                         elevation: 0.5,
-                        color: const Color(0xFFFCFBF7),
+                        color: theme.surfaceBg,
                         margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(8),
-                          side: const BorderSide(color: Color(0xFFE9E7DE)),
+                          side: BorderSide(color: theme.cardBorder),
                         ),
                         child: InkWell(
                           borderRadius: BorderRadius.circular(8),
@@ -651,20 +657,20 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                               children: [
                                 Row(
                                   children: [
-                                    const Icon(Icons.bookmark, size: 15, color: Color(0xFFC87D2E)),
+                                    Icon(Icons.bookmark, size: 15, color: theme.accent),
                                     const SizedBox(width: 4),
                                     Expanded(
                                       child: Text(
                                         bm.chapterTitle,
                                         maxLines: 1,
                                         overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF743C00)),
+                                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: theme.highlightText),
                                       ),
                                     ),
                                     IconButton(
                                       visualDensity: VisualDensity.compact,
                                       padding: EdgeInsets.zero,
-                                      icon: const Icon(Icons.delete_outline, size: 16, color: Colors.blueGrey),
+                                      icon: Icon(Icons.delete_outline, size: 16, color: theme.secondaryText),
                                       tooltip: "删除书签",
                                       onPressed: () => widget.onBookmarkDelete(bm),
                                     ),
@@ -675,19 +681,19 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                                   "“${bm.content}”",
                                   maxLines: 2,
                                   overflow: TextOverflow.ellipsis,
-                                  style: const TextStyle(fontSize: 12, color: Color(0xFF2C3238), fontStyle: FontStyle.italic, height: 1.3),
+                                  style: TextStyle(fontSize: 12, color: theme.primaryText, fontStyle: FontStyle.italic, height: 1.3),
                                 ),
                                 if (bm.note.isNotEmpty) ...[
                                   const SizedBox(height: 4),
                                   Container(
                                     width: double.infinity,
                                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                                    decoration: BoxDecoration(color: const Color(0xFFF1ECE0), borderRadius: BorderRadius.circular(4)),
+                                    decoration: BoxDecoration(color: theme.chipBg, borderRadius: BorderRadius.circular(4)),
                                     child: Text(
                                       "💬 ${bm.note}",
                                       maxLines: 2,
                                       overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(fontSize: 11, color: Color(0xFF5A442E)),
+                                      style: TextStyle(fontSize: 11, color: theme.highlightText),
                                     ),
                                   ),
                                 ],
@@ -695,16 +701,16 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                                 Row(
                                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                   children: [
-                                    Text(dateStr, style: const TextStyle(fontSize: 10, color: Colors.blueGrey)),
+                                    Text(dateStr, style: TextStyle(fontSize: 10, color: theme.secondaryText)),
                                     InkWell(
                                       onTap: () => widget.onBookmarkEdit(bm),
-                                      child: const Padding(
-                                        padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
                                         child: Row(
                                           children: [
-                                            Icon(Icons.edit_note, size: 14, color: Color(0xFFC87D2E)),
-                                            SizedBox(width: 2),
-                                            Text("编辑备注", style: TextStyle(fontSize: 10.5, color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                                            Icon(Icons.edit_note, size: 14, color: theme.accent),
+                                            const SizedBox(width: 2),
+                                            Text("编辑备注", style: TextStyle(fontSize: 10.5, color: theme.accent, fontWeight: FontWeight.bold)),
                                           ],
                                         ),
                                       ),
@@ -724,10 +730,10 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
             if (widget.isSelectionMode && widget.sidebarTab == 1)
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                color: Colors.white,
+                color: theme.surfaceBg,
                 child: Row(
                   children: [
-                    Text("已选 ${widget.selectedFingerprints.length} 项", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                    Text("已选 ${widget.selectedFingerprints.length} 项", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: theme.primaryText)),
                     const Spacer(),
                     TextButton(
                       onPressed: widget.onSelectAllToggle,
@@ -740,6 +746,23 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                     ),
                   ],
                 ),
+              )
+            else if (widget.hasBookLoaded)
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
+                decoration: BoxDecoration(
+                  color: theme.surfaceBg,
+                  border: Border(top: BorderSide(color: theme.cardBorder)),
+                ),
+                child: OutlinedButton.icon(
+                  icon: Icon(Icons.audio_file_outlined, size: 18, color: theme.accent),
+                  label: Text("批量合成导出 MP3", style: TextStyle(color: theme.primaryText, fontWeight: FontWeight.w600)),
+                  onPressed: () {
+                    Navigator.pop(context);
+                    widget.onExportMp3Tap();
+                  },
+                ),
               ),
           ],
         ),
@@ -750,6 +773,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
 
 // ────────────────── 3. 空白无书时的初始展示层 ──────────────────
 class EmptyBookshelfView extends StatelessWidget {
+  final ReaderThemeConfig theme;
   final List<BookHistoryItem> bookList;
   final VoidCallback onImportFile;
   final ValueChanged<String> onOpenBook;
@@ -757,6 +781,7 @@ class EmptyBookshelfView extends StatelessWidget {
 
   const EmptyBookshelfView({
     super.key,
+    required this.theme,
     required this.bookList,
     required this.onImportFile,
     required this.onOpenBook,
@@ -772,28 +797,29 @@ class EmptyBookshelfView extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             ElevatedButton.icon(
-              icon: const Icon(Icons.auto_stories, color: Color(0xFFC87D2E), size: 24),
-              label: const Text("原位打开 TXT / EPUB / MD (零拷贝)", style: TextStyle(color: Color(0xFF2C3238), fontSize: 16)),
+              icon: Icon(Icons.auto_stories, color: theme.accent, size: 24),
+              label: Text("原位打开 TXT / EPUB / MD (零拷贝)", style: TextStyle(color: theme.primaryText, fontSize: 16)),
               style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFCFBF7),
+                backgroundColor: theme.surfaceBg,
                 elevation: 1,
                 padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-                side: const BorderSide(color: Color(0xFFE9E7DE)),
+                side: BorderSide(color: theme.cardBorder),
               ),
               onPressed: onImportFile,
             ),
             if (bookList.isNotEmpty) ...[
               const SizedBox(height: 32),
-              const Text("📚 最近阅读书架 (基于文件指纹原位承接):", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey, fontSize: 14)),
+              Text("📚 最近阅读书架 (基于文件指纹原位承接):", style: TextStyle(fontWeight: FontWeight.bold, color: theme.secondaryText, fontSize: 14)),
               const SizedBox(height: 12),
               ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 550),
                 child: Card(
+                  color: theme.surfaceBg,
                   child: ListView.separated(
                     shrinkWrap: true,
                     physics: const NeverScrollableScrollPhysics(),
                     itemCount: min(bookList.length, 6),
-                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    separatorBuilder: (_, __) => Divider(height: 1, color: theme.cardBorder),
                     itemBuilder: (ctx, idx) {
                       final item = bookList[idx];
                       final bool fileExists = File(item.lastKnownPath).existsSync();
@@ -809,13 +835,13 @@ class EmptyBookshelfView extends StatelessWidget {
                             fontWeight: FontWeight.bold,
                             fontSize: 13,
                             height: 1.25,
-                            color: fileExists ? const Color(0xFF2C3238) : Colors.redAccent,
+                            color: fileExists ? theme.primaryText : Colors.redAccent,
                           ),
                         ),
                         subtitle: Row(
                           children: [
-                            if (sizeStr.isNotEmpty) Text("$sizeStr · ", style: const TextStyle(fontSize: 10, color: Colors.blueGrey)),
-                            Text("上次读到: ${(item.percentage * 100).toStringAsFixed(1)}%", style: const TextStyle(fontSize: 10, color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                            if (sizeStr.isNotEmpty) Text("$sizeStr · ", style: TextStyle(fontSize: 10, color: theme.secondaryText)),
+                            Text("上次读到: ${(item.percentage * 100).toStringAsFixed(1)}%", style: TextStyle(fontSize: 10, color: theme.accent, fontWeight: FontWeight.bold)),
                             if (!fileExists)
                               const Padding(padding: EdgeInsets.only(left: 6), child: Text("(未连接·点击重链)", style: TextStyle(fontSize: 10, color: Colors.redAccent))),
                           ],
@@ -842,6 +868,7 @@ class EmptyBookshelfView extends StatelessWidget {
 
 // ────────────────── 4. MP3 导出最小化浮球徽标 ──────────────────
 class MinimizedExportBadge extends StatelessWidget {
+  final ReaderThemeConfig theme;
   final int done;
   final int total;
   final int elapsedSeconds;
@@ -849,6 +876,7 @@ class MinimizedExportBadge extends StatelessWidget {
 
   const MinimizedExportBadge({
     super.key,
+    required this.theme,
     required this.done,
     required this.total,
     required this.elapsedSeconds,
@@ -865,7 +893,7 @@ class MinimizedExportBadge extends StatelessWidget {
       child: Material(
         elevation: 8,
         borderRadius: BorderRadius.circular(20),
-        color: const Color(0xFFFCFBF7),
+        color: theme.surfaceBg,
         child: InkWell(
           borderRadius: BorderRadius.circular(20),
           onTap: onTap,
@@ -873,16 +901,16 @@ class MinimizedExportBadge extends StatelessWidget {
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(20),
-              border: Border.all(color: const Color(0xFFC87D2E), width: 1.5),
+              border: Border.all(color: theme.accent, width: 1.5),
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFFC87D2E))),
+                SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2, color: theme.accent)),
                 const SizedBox(width: 8),
-                Text("导出中: $done/$total (已耗时: $timeStr)", style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
+                Text("导出中: $done/$total (已耗时: $timeStr)", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: theme.highlightText)),
                 const SizedBox(width: 6),
-                const Icon(Icons.open_in_full, size: 14, color: Color(0xFFC87D2E)),
+                Icon(Icons.open_in_full, size: 14, color: theme.accent),
               ],
             ),
           ),
