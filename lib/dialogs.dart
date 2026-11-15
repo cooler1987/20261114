@@ -59,7 +59,7 @@ class ExportController extends ChangeNotifier {
     final int count = eIdx - sIdx;
     if (count <= 0) return;
 
-    AppLogger.log("启动 MP3 批量导出 [范围: ${sIdx + 1}..$eIdx (共 $count 单元), 引擎: $exportEngine, 并发: $exportThreads]");
+    AppLogger.log("启动 MP3 批量导出 [范围: ${sIdx + 1}..$eIdx (共 $count 单元), 引擎: $exportEngine, 并发: $exportThreads]", null, null, true);
 
     _stopwatch = Stopwatch()..start();
     _ticker?.cancel();
@@ -218,6 +218,670 @@ class ExportController extends ChangeNotifier {
   }
 }
 
+// ────────────────── 全屏自适应系统设置页 (移动端不局促 + 分引擎3态网络) ──────────────────
+class ReaderSettingsPage extends StatefulWidget {
+  final String currentEngine;
+  final String apiKey;
+  final String fishModel;
+  final int bitrate;
+  final int timeoutSeconds;
+  final int preloadCount;
+  final int exportThreads;
+  final int intervalPauseMs;
+  final int maxCacheCount;
+  final TtsNetworkRouter networkRouter;
+  final List<CustomTtsEngineConfig> customEngines;
+  final bool followAlong;
+  final String splitMode;
+  final double fontSize;
+  final String logLevel;
+  final String lastBackupDir;
+
+  final Future<void> Function() onExportBackup;
+  final Function(String newBackupDir) onBackupDirChanged;
+  final Future<bool> Function() onShowRestorePicker;
+  final Future<void> Function() onOpenCustomEnginesManager;
+  final Future<void> Function({
+    required String engine,
+    required String apiKey,
+    required String fishModel,
+    required int bitrate,
+    required int timeoutSeconds,
+    required int preloadCount,
+    required int exportThreads,
+    required int intervalPauseMs,
+    required int maxCacheCount,
+    required Map<String, String> engineNetworkModes,
+    required Map<String, String> engineCustomProxies,
+    required bool followAlong,
+    required String splitMode,
+    required double fontSize,
+    required String logLevel,
+  }) onSave;
+
+  const ReaderSettingsPage({
+    super.key,
+    required this.currentEngine,
+    required this.apiKey,
+    required this.fishModel,
+    required this.bitrate,
+    required this.timeoutSeconds,
+    required this.preloadCount,
+    required this.exportThreads,
+    required this.intervalPauseMs,
+    required this.maxCacheCount,
+    required this.networkRouter,
+    required this.customEngines,
+    required this.followAlong,
+    required this.splitMode,
+    required this.fontSize,
+    required this.logLevel,
+    required this.lastBackupDir,
+    required this.onExportBackup,
+    required this.onBackupDirChanged,
+    required this.onShowRestorePicker,
+    required this.onOpenCustomEnginesManager,
+    required this.onSave,
+  });
+
+  @override
+  State<ReaderSettingsPage> createState() => _ReaderSettingsPageState();
+}
+
+class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
+  late TextEditingController _keyCtrl;
+  late String _tempEngine;
+  late String _tempFishModel;
+  late int _tempBitrate;
+  late int _tempTimeout;
+  late int _tempPreload;
+  late int _tempExportThreads;
+  late int _tempIntervalPause;
+  late int _tempMaxCache;
+  late bool _tempAutoScroll;
+  late String _tempSplit;
+  late double _tempFontSize;
+  late String _tempLogLevel;
+  late String _tempBackupDir;
+
+  late Map<String, String> _tempRoutes;
+  final Map<String, TextEditingController> _customProxyCtrls = {};
+  bool _probingProxy = false;
+  bool _showFishConfigAlways = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _keyCtrl = TextEditingController(text: widget.apiKey);
+    _tempEngine = widget.currentEngine;
+    _tempFishModel = fishModelOptions.contains(widget.fishModel) ? widget.fishModel : fishModelOptions.first;
+    _tempBitrate = widget.bitrate;
+    _tempTimeout = widget.timeoutSeconds;
+    _tempPreload = widget.preloadCount;
+    _tempExportThreads = widget.exportThreads;
+    _tempIntervalPause = widget.intervalPauseMs;
+    _tempMaxCache = widget.maxCacheCount;
+    _tempAutoScroll = widget.followAlong;
+    _tempSplit = widget.splitMode;
+    _tempFontSize = widget.fontSize.clamp(10.0, 20.0);
+    _tempLogLevel = AppLogger.normalizeLevel(widget.logLevel);
+    _tempBackupDir = widget.lastBackupDir;
+    _showFishConfigAlways = _tempEngine == 'fish' || widget.apiKey.isNotEmpty;
+
+    _tempRoutes = Map<String, String>.from(widget.networkRouter.engineNetworkModes);
+    _syncEngineNetworkState();
+  }
+
+  void _syncEngineNetworkState() {
+    _tempRoutes['ms'] = normalizeEngineNetworkMode(_tempRoutes['ms']);
+    _tempRoutes['fish'] = normalizeEngineNetworkMode(_tempRoutes['fish']);
+    _customProxyCtrls.putIfAbsent('ms', () => TextEditingController(text: widget.networkRouter.engineCustomProxies['ms'] ?? ''));
+    _customProxyCtrls.putIfAbsent('fish', () => TextEditingController(text: widget.networkRouter.engineCustomProxies['fish'] ?? ''));
+
+    for (final c in widget.customEngines) {
+      _tempRoutes[c.id] = normalizeEngineNetworkMode(c.networkMode);
+      _customProxyCtrls.putIfAbsent(c.id, () => TextEditingController(text: c.customProxy));
+    }
+  }
+
+  @override
+  void dispose() {
+    _keyCtrl.dispose();
+    for (final ctrl in _customProxyCtrls.values) {
+      ctrl.dispose();
+    }
+    super.dispose();
+  }
+
+  Widget _buildSectionTitle(String title) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Text(title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
+    );
+  }
+
+  Widget _buildEngineRouteRow(String engineId, String displayName) {
+    final mode = normalizeEngineNetworkMode(_tempRoutes[engineId]);
+    final proxyCtrl = _customProxyCtrls.putIfAbsent(engineId, () => TextEditingController());
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF6F4EC),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFE5E1D5)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(displayName, style: const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: Color(0xFF2C3238))),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<String>(
+              style: SegmentedButton.styleFrom(
+                visualDensity: VisualDensity.compact,
+                padding: const EdgeInsets.symmetric(horizontal: 6),
+              ),
+              segments: const [
+                ButtonSegment(value: 'direct', label: Text('直连', style: TextStyle(fontSize: 12)), icon: Icon(Icons.public, size: 15)),
+                ButtonSegment(value: 'system', label: Text('系统代理', style: TextStyle(fontSize: 12)), icon: Icon(Icons.laptop_windows_outlined, size: 15)),
+                ButtonSegment(value: 'custom', label: Text('自定端口', style: TextStyle(fontSize: 12)), icon: Icon(Icons.vpn_lock, size: 15)),
+              ],
+              selected: {mode},
+              onSelectionChanged: (v) => setState(() => _tempRoutes[engineId] = v.first),
+            ),
+          ),
+          if (mode == 'custom') ...[
+            const SizedBox(height: 8),
+            TextField(
+              controller: proxyCtrl,
+              decoration: InputDecoration(
+                labelText: '自定义代理地址 / 端口',
+                hintText: '如 127.0.0.1:7890 或直接填 7890',
+                isDense: true,
+                filled: true,
+                fillColor: Colors.white,
+                border: const OutlineInputBorder(),
+                suffixIcon: proxyCtrl.text.isNotEmpty
+                    ? IconButton(
+                        icon: const Icon(Icons.clear, size: 16),
+                        onPressed: () => setState(() => proxyCtrl.clear()),
+                      )
+                    : null,
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+          ] else if (mode == 'system') ...[
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                widget.networkRouter.detectedSystemProxy?.isNotEmpty == true
+                    ? "将使用系统代理: ${widget.networkRouter.detectedSystemProxy}"
+                    : "⚠️ 当前未检测到系统代理，将自动回退直连",
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: widget.networkRouter.detectedSystemProxy?.isNotEmpty == true ? Colors.teal.shade700 : Colors.orange.shade800,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _handleSave() async {
+    final customProxies = <String, String>{};
+    _customProxyCtrls.forEach((k, ctrl) {
+      customProxies[k] = normalizeProxyInput(ctrl.text);
+    });
+
+    await widget.onSave(
+      engine: _tempEngine,
+      apiKey: _keyCtrl.text.trim(),
+      fishModel: _tempFishModel,
+      bitrate: _tempBitrate,
+      timeoutSeconds: _tempTimeout,
+      preloadCount: _tempPreload,
+      exportThreads: _tempExportThreads,
+      intervalPauseMs: _tempIntervalPause,
+      maxCacheCount: _tempMaxCache,
+      engineNetworkModes: _tempRoutes,
+      engineCustomProxies: customProxies,
+      followAlong: _tempAutoScroll,
+      splitMode: _tempSplit,
+      fontSize: _tempFontSize,
+      logLevel: _tempLogLevel,
+    );
+    if (mounted) Navigator.pop(context);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final allEngineIds = <String>{'ms', 'fish', ...widget.customEngines.map((e) => e.id)};
+    if (!allEngineIds.contains(_tempEngine)) _tempEngine = 'ms';
+
+    return Scaffold(
+      backgroundColor: const Color(0xFFF6F4EC),
+      appBar: AppBar(
+        leading: IconButton(icon: const Icon(Icons.close), tooltip: "取消", onPressed: () => Navigator.pop(context)),
+        title: const Text("系统与引擎设置"),
+        actions: [
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: FilledButton.icon(
+              icon: const Icon(Icons.check, size: 18),
+              label: const Text("保存配置"),
+              onPressed: _handleSave,
+            ),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 760),
+            child: ListView(
+              padding: const EdgeInsets.fromLTRB(14, 10, 14, 32),
+              children: [
+                // 1. 引擎与品质
+                Card(
+                  color: const Color(0xFFFCFBF7),
+                  elevation: 0.5,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: Color(0xFFE7E2D5))),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            _buildSectionTitle("🔊 TTS 引擎与品质"),
+                            FilledButton.tonalIcon(
+                              style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
+                              icon: const Icon(Icons.extension_outlined, size: 16),
+                              label: Text("自定义引擎 (${widget.customEngines.length})", style: const TextStyle(fontSize: 12)),
+                              onPressed: () async {
+                                await widget.onOpenCustomEnginesManager();
+                                _syncEngineNetworkState();
+                                if (mounted) setState(() {});
+                              },
+                            ),
+                          ],
+                        ),
+                        DropdownButtonFormField<String>(
+                          value: _tempEngine,
+                          decoration: const InputDecoration(labelText: '当前朗读引擎', isDense: true, border: OutlineInputBorder()),
+                          items: [
+                            const DropdownMenuItem(value: 'ms', child: Text('微软官方 (免Key)')),
+                            const DropdownMenuItem(value: 'fish', child: Text('Fish Audio 官方引擎')),
+                            ...widget.customEngines.map((c) => DropdownMenuItem(value: c.id, child: Text('🧩 ${c.name}', overflow: TextOverflow.ellipsis))),
+                          ],
+                          onChanged: (v) {
+                            if (v != null) {
+                              setState(() {
+                                _tempEngine = v;
+                                if (v == 'fish') _showFishConfigAlways = true;
+                              });
+                            }
+                          },
+                        ),
+                        const SizedBox(height: 10),
+                        if (_tempEngine == 'fish' || _showFishConfigAlways) ...[
+                          TextField(
+                            controller: _keyCtrl,
+                            decoration: const InputDecoration(
+                              labelText: 'Fish Audio API Key',
+                              hintText: '填入 Fish Audio 官方 Key',
+                              isDense: true,
+                              border: OutlineInputBorder(),
+                            ),
+                          ),
+                          const SizedBox(height: 10),
+                          DropdownButtonFormField<String>(
+                            value: _tempFishModel,
+                            decoration: const InputDecoration(labelText: 'Fish 模型版本', isDense: true, border: OutlineInputBorder()),
+                            items: fishModelOptions.map((m) => DropdownMenuItem(value: m, child: Text(m))).toList(),
+                            onChanged: (v) {
+                              if (v != null) setState(() => _tempFishModel = v);
+                            },
+                          ),
+                          const SizedBox(height: 10),
+                        ] else ...[
+                          Align(
+                            alignment: Alignment.centerLeft,
+                            child: TextButton.icon(
+                              style: TextButton.styleFrom(visualDensity: VisualDensity.compact, padding: EdgeInsets.zero),
+                              icon: const Icon(Icons.key, size: 16),
+                              label: const Text("展开 Fish Audio Key 与模型设置", style: TextStyle(fontSize: 12)),
+                              onPressed: () => setState(() => _showFishConfigAlways = true),
+                            ),
+                          ),
+                        ],
+                        DropdownButtonFormField<int>(
+                          value: _tempBitrate,
+                          decoration: const InputDecoration(labelText: '音频合成质量', isDense: true, border: OutlineInputBorder()),
+                          items: const [
+                            DropdownMenuItem(value: 64, child: Text('64 kbps (默认 · 极速省流)')),
+                            DropdownMenuItem(value: 128, child: Text('128 kbps (高品质清晰)')),
+                          ],
+                          onChanged: (v) => setState(() => _tempBitrate = v ?? 64),
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("单句合成超时等待上限:"),
+                            Text("$_tempTimeout 秒", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempTimeout.toDouble(),
+                          min: 20,
+                          max: 120,
+                          divisions: 100,
+                          label: "$_tempTimeout 秒",
+                          onChanged: (v) => setState(() => _tempTimeout = v.toInt()),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 10),
+
+                // 2. 分引擎 3 态网络通道
+                Card(
+                  color: const Color(0xFFFCFBF7),
+                  elevation: 0.5,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: Color(0xFFE7E2D5))),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            _buildSectionTitle("🌐 分引擎网络通道 (默认直连)"),
+                            OutlinedButton.icon(
+                              style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact),
+                              icon: _probingProxy
+                                  ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+                                  : const Icon(Icons.refresh, size: 15),
+                              label: const Text("探测系统代理", style: TextStyle(fontSize: 11.5)),
+                              onPressed: _probingProxy
+                                  ? null
+                                  : () async {
+                                      setState(() => _probingProxy = true);
+                                      await widget.networkRouter.refreshSystemProxy();
+                                      if (mounted) setState(() => _probingProxy = false);
+                                    },
+                            ),
+                          ],
+                        ),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                          margin: const EdgeInsets.only(bottom: 12),
+                          decoration: BoxDecoration(color: const Color(0xFFEFE7D2), borderRadius: BorderRadius.circular(8)),
+                          child: Text(
+                            "系统代理探测结果：${widget.networkRouter.detectedSystemProxy ?? '未检测到系统代理 (直连或手动填端口可用)'}",
+                            style: const TextStyle(fontSize: 12, color: Color(0xFF743C00)),
+                          ),
+                        ),
+                        _buildEngineRouteRow('ms', '微软官方引擎'),
+                        _buildEngineRouteRow('fish', 'Fish Audio 官方引擎'),
+                        for (final c in widget.customEngines) _buildEngineRouteRow(c.id, '🧩 ${c.name}'),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 10),
+
+                // 3. 阅读字体与朗读规则
+                Card(
+                  color: const Color(0xFFFCFBF7),
+                  elevation: 0.5,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: Color(0xFFE7E2D5))),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _buildSectionTitle("📖 排版字体与朗读规则"),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("正文字体大小 (10–20 px):"),
+                            Row(
+                              children: [
+                                Text(
+                                  "${_tempFontSize.toStringAsFixed(1).replaceAll('.0', '')} px",
+                                  style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold),
+                                ),
+                                const SizedBox(width: 8),
+                                TextButton(
+                                  style: TextButton.styleFrom(visualDensity: VisualDensity.compact, padding: EdgeInsets.zero),
+                                  onPressed: () => setState(() => _tempFontSize = 14.0),
+                                  child: const Text("恢复14px", style: TextStyle(fontSize: 11.5)),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempFontSize,
+                          min: 10.0,
+                          max: 20.0,
+                          divisions: 20,
+                          label: "${_tempFontSize.toStringAsFixed(1).replaceAll('.0', '')} px",
+                          onChanged: (v) => setState(() => _tempFontSize = double.parse(v.toStringAsFixed(1))),
+                        ),
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          margin: const EdgeInsets.only(bottom: 12),
+                          decoration: BoxDecoration(color: const Color(0xFFF6F4EC), borderRadius: BorderRadius.circular(8)),
+                          child: Text(
+                            "字体预览：春风拂槛露华浓，静听书声伴晚钟。",
+                            style: TextStyle(fontSize: _tempFontSize, color: const Color(0xFF2D2E2F), height: 1.6),
+                          ),
+                        ),
+                        DropdownButtonFormField<String>(
+                          value: _tempSplit,
+                          decoration: const InputDecoration(labelText: '朗读断句规则 (CharOffset 无缝定位)', isDense: true, border: OutlineInputBorder()),
+                          items: const [
+                            DropdownMenuItem(value: 'sentence', child: Text('按标点断句朗读 (推荐)')),
+                            DropdownMenuItem(value: 'paragraph', child: Text('按自然段落朗读')),
+                          ],
+                          onChanged: (v) {
+                            if (v != null) setState(() => _tempSplit = v);
+                          },
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("句/段朗读间隔停顿:"),
+                            Text("$_tempIntervalPause ms", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempIntervalPause.toDouble(),
+                          min: 0,
+                          max: 1500,
+                          divisions: 15,
+                          label: "$_tempIntervalPause ms",
+                          onChanged: (v) => setState(() => _tempIntervalPause = (v / 50).round() * 50),
+                        ),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text("朗读时正文视线平滑居中", style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.bold)),
+                          value: _tempAutoScroll,
+                          onChanged: (v) => setState(() => _tempAutoScroll = v),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 10),
+
+                // 4. 性能与缓存
+                Card(
+                  color: const Color(0xFFFCFBF7),
+                  elevation: 0.5,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: Color(0xFFE7E2D5))),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _buildSectionTitle("⚡ 性能、预读与缓存"),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("朗读后台预读缓存:"),
+                            Text("$_tempPreload 句", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempPreload.toDouble(),
+                          min: 1,
+                          max: 15,
+                          divisions: 14,
+                          label: "$_tempPreload 句",
+                          onChanged: (v) => setState(() => _tempPreload = v.toInt()),
+                        ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("导出 MP3 默认并发线程:"),
+                            Text("$_tempExportThreads 线程", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempExportThreads.toDouble(),
+                          min: 1,
+                          max: 16,
+                          divisions: 15,
+                          label: "$_tempExportThreads 线程",
+                          onChanged: (v) => setState(() => _tempExportThreads = v.toInt()),
+                        ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("音频内存最大缓存上限:"),
+                            Text("$_tempMaxCache 句", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempMaxCache.toDouble(),
+                          min: 50,
+                          max: 300,
+                          divisions: 25,
+                          label: "$_tempMaxCache",
+                          onChanged: (v) => setState(() => _tempMaxCache = v.toInt()),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 10),
+
+                // 5. 备份、恢复与日志记录层级
+                Card(
+                  color: const Color(0xFFFCFBF7),
+                  elevation: 0.5,
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14), side: const BorderSide(color: Color(0xFFE7E2D5))),
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _buildSectionTitle("💾 备份、恢复与日志层级"),
+                        const Text("运行日志记录层级:", style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          width: double.infinity,
+                          child: SegmentedButton<String>(
+                            style: SegmentedButton.styleFrom(visualDensity: VisualDensity.compact),
+                            segments: const [
+                              ButtonSegment(value: 'error', label: Text('仅错误', style: TextStyle(fontSize: 12))),
+                              ButtonSegment(value: 'info', label: Text('重要事件', style: TextStyle(fontSize: 12))),
+                              ButtonSegment(value: 'all', label: Text('全量调试', style: TextStyle(fontSize: 12))),
+                            ],
+                            selected: {_tempLogLevel},
+                            onSelectionChanged: (v) => setState(() => _tempLogLevel = v.first),
+                          ),
+                        ),
+                        const Divider(height: 22),
+                        Text("当前备份目录:\n$_tempBackupDir", style: const TextStyle(fontSize: 11.5, color: Colors.blueGrey, height: 1.4)),
+                        const SizedBox(height: 10),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            OutlinedButton.icon(
+                              icon: const Icon(Icons.folder_open, size: 16),
+                              label: const Text("更改目录"),
+                              onPressed: () async {
+                                String? newDir;
+                                if (Platform.isAndroid) {
+                                  newDir = await StorageHelper.browseSharedStorage(
+                                    context,
+                                    chooseDirectory: true,
+                                    extensions: [],
+                                    initialPath: _tempBackupDir,
+                                  );
+                                } else {
+                                  newDir = await FilePicker.platform.getDirectoryPath();
+                                }
+                                if (newDir != null) {
+                                  setState(() => _tempBackupDir = newDir!);
+                                  widget.onBackupDirChanged(newDir);
+                                }
+                              },
+                            ),
+                            FilledButton.icon(
+                              icon: const Icon(Icons.file_upload, size: 16),
+                              label: const Text("一键导出备份"),
+                              onPressed: () async {
+                                await widget.onExportBackup();
+                              },
+                            ),
+                            OutlinedButton.icon(
+                              icon: const Icon(Icons.restore, size: 16),
+                              label: const Text("选择文件恢复"),
+                              onPressed: () async {
+                                final restored = await widget.onShowRestorePicker();
+                                // 若已成功恢复，直接退出设置页防止点击“保存配置”用旧表单状态覆盖恢复数据
+                                if (restored && mounted) {
+                                  Navigator.pop(context);
+                                }
+                              },
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 // ────────────────── 弹窗集合门面 ──────────────────
 class ReaderDialogs {
   static String getEngineDisplayName(String engineId, List<CustomTtsEngineConfig> customEngines) {
@@ -229,8 +893,8 @@ class ReaderDialogs {
     return engineId;
   }
 
-  // 1. 系统设置弹窗 (整合 10-20px 字体调节 + 引擎管理入口 + 分引擎直连/代理设置)
-  static void showSettingsDialog({
+  // 1. 打开全屏设置页
+  static Future<void> openSettingsPage({
     required BuildContext context,
     required String currentEngine,
     required String apiKey,
@@ -241,19 +905,18 @@ class ReaderDialogs {
     required int exportThreads,
     required int intervalPauseMs,
     required int maxCacheCount,
-    required String proxyMode,
-    required String customProxy,
-    required Map<String, String> engineNetworkModes,
+    required TtsNetworkRouter networkRouter,
     required List<CustomTtsEngineConfig> customEngines,
     required bool followAlong,
     required String splitMode,
     required double fontSize,
+    required String logLevel,
     required String lastBackupDir,
-    required VoidCallback onExportBackup,
+    required Future<void> Function() onExportBackup,
     required Function(String newBackupDir) onBackupDirChanged,
-    required VoidCallback onShowRestorePicker,
+    required Future<bool> Function() onShowRestorePicker,
     required Future<void> Function() onOpenCustomEnginesManager,
-    required Function({
+    required Future<void> Function({
       required String engine,
       required String apiKey,
       required String fishModel,
@@ -263,433 +926,46 @@ class ReaderDialogs {
       required int exportThreads,
       required int intervalPauseMs,
       required int maxCacheCount,
-      required String proxyMode,
-      required String customProxy,
       required Map<String, String> engineNetworkModes,
+      required Map<String, String> engineCustomProxies,
       required bool followAlong,
       required String splitMode,
       required double fontSize,
+      required String logLevel,
     }) onSave,
   }) {
-    final keyCtrl = TextEditingController(text: apiKey);
-    final proxyCtrl = TextEditingController(text: customProxy);
-    int tempPreload = preloadCount;
-    int tempExportThreads = exportThreads;
-    int tempBitrate = bitrate;
-    int tempTimeout = timeoutSeconds;
-    int tempIntervalPause = intervalPauseMs;
-    int tempMaxCache = maxCacheCount;
-    String tempEngine = currentEngine;
-    String tempFishModel = fishModelOptions.contains(fishModel) ? fishModel : fishModelOptions.first;
-    String tempSplit = splitMode;
-    double tempFontSize = fontSize.clamp(10.0, 20.0);
-    String tempProxyMode = (proxyMode == 'manual') ? 'manual' : 'auto';
-    final Map<String, String> tempRoutes = Map<String, String>.from(engineNetworkModes);
-    tempRoutes.putIfAbsent('ms', () => 'direct');
-    tempRoutes.putIfAbsent('fish', () => 'direct');
-    for (final c in customEngines) {
-      tempRoutes[c.id] = c.networkMode;
-    }
-    bool tempAutoScroll = followAlong;
-    String tempBackupDir = lastBackupDir;
-
-    showDialog(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (ctx, setDlgState) {
-          final allEngineIds = <String>{'ms', 'fish', ...customEngines.map((e) => e.id)};
-          if (!allEngineIds.contains(tempEngine)) tempEngine = 'ms';
-
-          return AlertDialog(
-            title: const Text('系统与引擎设置'),
-            content: SizedBox(
-              width: min(560.0, MediaQuery.of(ctx).size.width * 0.92),
-              height: min(560.0, MediaQuery.of(ctx).size.height * 0.78),
-              child: SingleChildScrollView(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // ── 引擎与品质 ──
-                    Card(
-                      color: const Color(0xFFFCFBF7),
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text("🔊 TTS 引擎与品质", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
-                                TextButton.icon(
-                                  style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
-                                  icon: const Icon(Icons.extension_outlined, size: 16),
-                                  label: Text("自定义引擎 (${customEngines.length})", style: const TextStyle(fontSize: 12)),
-                                  onPressed: () async {
-                                    await onOpenCustomEnginesManager();
-                                    for (final c in customEngines) {
-                                      tempRoutes[c.id] = c.networkMode;
-                                    }
-                                    setDlgState(() {});
-                                  },
-                                ),
-                              ],
-                            ),
-                            const SizedBox(height: 6),
-                            DropdownButtonFormField<String>(
-                              value: tempEngine,
-                              decoration: const InputDecoration(labelText: '当前朗读引擎', isDense: true),
-                              items: [
-                                const DropdownMenuItem(value: 'ms', child: Text('微软官方 (免Key)')),
-                                const DropdownMenuItem(value: 'fish', child: Text('Fish Audio 官方引擎')),
-                                ...customEngines.map((c) => DropdownMenuItem(value: c.id, child: Text('🧩 ${c.name}', overflow: TextOverflow.ellipsis))),
-                              ],
-                              onChanged: (v) {
-                                if (v != null) setDlgState(() => tempEngine = v);
-                              },
-                            ),
-                            if (tempEngine == 'fish') ...[
-                              const SizedBox(height: 8),
-                              TextField(controller: keyCtrl, decoration: const InputDecoration(labelText: 'Fish Audio API Key', isDense: true)),
-                              const SizedBox(height: 8),
-                              DropdownButtonFormField<String>(
-                                value: tempFishModel,
-                                decoration: const InputDecoration(labelText: 'Fish 模型版本', isDense: true),
-                                items: fishModelOptions.map((m) => DropdownMenuItem(value: m, child: Text(m))).toList(),
-                                onChanged: (v) {
-                                  if (v != null) setDlgState(() => tempFishModel = v);
-                                },
-                              ),
-                            ],
-                            const SizedBox(height: 8),
-                            DropdownButtonFormField<int>(
-                              value: tempBitrate,
-                              decoration: const InputDecoration(labelText: '音频合成质量', isDense: true),
-                              items: const [
-                                DropdownMenuItem(value: 64, child: Text('64 kbps (默认 · 极速省流)')),
-                                DropdownMenuItem(value: 128, child: Text('128 kbps (高品质清晰)')),
-                              ],
-                              onChanged: (v) => setDlgState(() => tempBitrate = v ?? 64),
-                            ),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text("单句合成超时等待上限:"),
-                                Text("$tempTimeout 秒", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
-                              ],
-                            ),
-                            Slider(
-                              value: tempTimeout.toDouble(),
-                              min: 20,
-                              max: 120,
-                              divisions: 100,
-                              label: "$tempTimeout 秒",
-                              onChanged: (v) => setDlgState(() => tempTimeout = v.toInt()),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-
-                    // ── 阅读字体与朗读规则 ──
-                    Card(
-                      color: const Color(0xFFFCFBF7),
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text("📖 排版字体与朗读规则", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
-                            const SizedBox(height: 6),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text("正文字体大小 (10–20 px):"),
-                                Row(
-                                  children: [
-                                    Text(
-                                      "${tempFontSize.toStringAsFixed(1).replaceAll('.0', '')} px",
-                                      style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    TextButton(
-                                      style: TextButton.styleFrom(visualDensity: VisualDensity.compact, padding: EdgeInsets.zero),
-                                      onPressed: () => setDlgState(() => tempFontSize = 14.0),
-                                      child: const Text("默认14", style: TextStyle(fontSize: 11)),
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                            Slider(
-                              value: tempFontSize,
-                              min: 10.0,
-                              max: 20.0,
-                              divisions: 20,
-                              label: "${tempFontSize.toStringAsFixed(1).replaceAll('.0', '')} px",
-                              onChanged: (v) => setDlgState(() => tempFontSize = double.parse(v.toStringAsFixed(1))),
-                            ),
-                            Container(
-                              width: double.infinity,
-                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                              margin: const EdgeInsets.only(bottom: 10),
-                              decoration: BoxDecoration(color: const Color(0xFFF6F4EC), borderRadius: BorderRadius.circular(6)),
-                              child: Text(
-                                "字体预览：春风拂槛露华浓，静听书声伴晚钟。",
-                                style: TextStyle(fontSize: tempFontSize, color: const Color(0xFF2D2E2F), height: 1.6),
-                              ),
-                            ),
-                            DropdownButtonFormField<String>(
-                              value: tempSplit,
-                              decoration: const InputDecoration(labelText: '朗读断句规则 (CharOffset 无缝定位)', isDense: true),
-                              items: const [
-                                DropdownMenuItem(value: 'sentence', child: Text('按标点断句朗读 (推荐)')),
-                                DropdownMenuItem(value: 'paragraph', child: Text('按自然段落朗读')),
-                              ],
-                              onChanged: (v) {
-                                if (v != null) setDlgState(() => tempSplit = v);
-                              },
-                            ),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text("句/段朗读间隔停顿:"),
-                                Text("$tempIntervalPause ms", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
-                              ],
-                            ),
-                            Slider(
-                              value: tempIntervalPause.toDouble(),
-                              min: 0,
-                              max: 1500,
-                              divisions: 15,
-                              label: "$tempIntervalPause ms",
-                              onChanged: (v) => setDlgState(() => tempIntervalPause = (v / 50).round() * 50),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-
-                    // ── 性能与缓存 ──
-                    Card(
-                      color: const Color(0xFFFCFBF7),
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text("⚡ 性能、缓存与并发", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text("朗读后台预读缓存:"),
-                                Text("$tempPreload 句", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
-                              ],
-                            ),
-                            Slider(
-                              value: tempPreload.toDouble(),
-                              min: 1,
-                              max: 15,
-                              divisions: 14,
-                              label: "$tempPreload 句",
-                              onChanged: (v) => setDlgState(() => tempPreload = v.toInt()),
-                            ),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text("导出 MP3 默认线程数:"),
-                                Text("$tempExportThreads 线程", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
-                              ],
-                            ),
-                            Slider(
-                              value: tempExportThreads.toDouble(),
-                              min: 1,
-                              max: 16,
-                              divisions: 15,
-                              label: "$tempExportThreads 线程",
-                              onChanged: (v) => setDlgState(() => tempExportThreads = v.toInt()),
-                            ),
-                            SwitchListTile(
-                              contentPadding: EdgeInsets.zero,
-                              title: const Text("朗读时正文视线平滑居中", style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold)),
-                              value: tempAutoScroll,
-                              onChanged: (v) => setDlgState(() => tempAutoScroll = v),
-                            ),
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                              children: [
-                                const Text("音频内存最大缓存上限:"),
-                                Text("$tempMaxCache 句", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
-                              ],
-                            ),
-                            Slider(
-                              value: tempMaxCache.toDouble(),
-                              min: 50,
-                              max: 300,
-                              divisions: 25,
-                              label: "$tempMaxCache",
-                              onChanged: (v) => setDlgState(() => tempMaxCache = v.toInt()),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-
-                    // ── 分引擎独立网络路由 + 全局代理参数 ──
-                    Card(
-                      color: const Color(0xFFFCFBF7),
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text("🌐 分引擎网络通道 (默认直连)", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
-                            const SizedBox(height: 6),
-                            for (final entry in [
-                              const MapEntry('ms', '微软官方引擎'),
-                              const MapEntry('fish', 'Fish Audio 引擎'),
-                              ...customEngines.map((c) => MapEntry(c.id, '🧩 ${c.name}')),
-                            ])
-                              Padding(
-                                padding: const EdgeInsets.symmetric(vertical: 3),
-                                child: Row(
-                                  children: [
-                                    Expanded(
-                                      child: Text(entry.value, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 12.5)),
-                                    ),
-                                    SegmentedButton<String>(
-                                      style: SegmentedButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 6)),
-                                      segments: const [
-                                        ButtonSegment(value: 'direct', label: Text('直连', style: TextStyle(fontSize: 11))),
-                                        ButtonSegment(value: 'proxy', label: Text('走代理', style: TextStyle(fontSize: 11))),
-                                      ],
-                                      selected: {tempRoutes[entry.key] == 'proxy' ? 'proxy' : 'direct'},
-                                      onSelectionChanged: (v) => setDlgState(() => tempRoutes[entry.key] = v.first),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            const Divider(height: 18),
-                            const Text("代理服务器地址 (仅当引擎设为「走代理」时使用):", style: TextStyle(fontSize: 12, color: Colors.blueGrey)),
-                            RadioListTile<String>(
-                              dense: true,
-                              contentPadding: EdgeInsets.zero,
-                              title: const Text("自动读取系统/Clash 代理"),
-                              value: "auto",
-                              groupValue: tempProxyMode,
-                              onChanged: (v) => setDlgState(() => tempProxyMode = v!),
-                            ),
-                            RadioListTile<String>(
-                              dense: true,
-                              contentPadding: EdgeInsets.zero,
-                              title: const Text("手动指定代理地址"),
-                              value: "manual",
-                              groupValue: tempProxyMode,
-                              onChanged: (v) => setDlgState(() => tempProxyMode = v!),
-                            ),
-                            if (tempProxyMode == "manual")
-                              TextField(
-                                controller: proxyCtrl,
-                                decoration: const InputDecoration(labelText: "代理地址与端口 (如 127.0.0.1:7890)", isDense: true),
-                              ),
-                          ],
-                        ),
-                      ),
-                    ),
-
-                    // ── 备份与恢复 ──
-                    Card(
-                      color: const Color(0xFFFCFBF7),
-                      child: Padding(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            const Text("💾 备份与恢复", style: TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
-                            const SizedBox(height: 6),
-                            Text("当前备份目录: $tempBackupDir", style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
-                            const SizedBox(height: 8),
-                            Wrap(
-                              spacing: 8,
-                              runSpacing: 8,
-                              children: [
-                                OutlinedButton.icon(
-                                  icon: const Icon(Icons.folder_open, size: 16),
-                                  label: const Text("更改目录"),
-                                  onPressed: () async {
-                                    String? newDir;
-                                    if (Platform.isAndroid) {
-                                      newDir = await StorageHelper.browseSharedStorage(
-                                        ctx,
-                                        chooseDirectory: true,
-                                        extensions: [],
-                                        initialPath: tempBackupDir,
-                                      );
-                                    } else {
-                                      newDir = await FilePicker.platform.getDirectoryPath();
-                                    }
-                                    if (newDir != null) {
-                                      setDlgState(() => tempBackupDir = newDir!);
-                                      onBackupDirChanged(newDir);
-                                    }
-                                  },
-                                ),
-                                FilledButton.icon(
-                                  icon: const Icon(Icons.file_upload, size: 16),
-                                  label: const Text("一键导出备份"),
-                                  onPressed: onExportBackup,
-                                ),
-                                OutlinedButton.icon(
-                                  icon: const Icon(Icons.restore, size: 16),
-                                  label: const Text("选择恢复"),
-                                  onPressed: onShowRestorePicker,
-                                ),
-                              ],
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            actions: [
-              TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('取消')),
-              FilledButton(
-                onPressed: () {
-                  onSave(
-                    engine: tempEngine,
-                    apiKey: keyCtrl.text.trim(),
-                    fishModel: tempFishModel,
-                    bitrate: tempBitrate,
-                    timeoutSeconds: tempTimeout,
-                    preloadCount: tempPreload,
-                    exportThreads: tempExportThreads,
-                    intervalPauseMs: tempIntervalPause,
-                    maxCacheCount: tempMaxCache,
-                    proxyMode: tempProxyMode,
-                    customProxy: proxyCtrl.text.trim(),
-                    engineNetworkModes: tempRoutes,
-                    followAlong: tempAutoScroll,
-                    splitMode: tempSplit,
-                    fontSize: tempFontSize,
-                  );
-                  Navigator.pop(dialogContext);
-                },
-                child: const Text('保存配置'),
-              ),
-            ],
-          );
-        },
+    return Navigator.push<void>(
+      context,
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => ReaderSettingsPage(
+          currentEngine: currentEngine,
+          apiKey: apiKey,
+          fishModel: fishModel,
+          bitrate: bitrate,
+          timeoutSeconds: timeoutSeconds,
+          preloadCount: preloadCount,
+          exportThreads: exportThreads,
+          intervalPauseMs: intervalPauseMs,
+          maxCacheCount: maxCacheCount,
+          networkRouter: networkRouter,
+          customEngines: customEngines,
+          followAlong: followAlong,
+          splitMode: splitMode,
+          fontSize: fontSize,
+          logLevel: logLevel,
+          lastBackupDir: lastBackupDir,
+          onExportBackup: onExportBackup,
+          onBackupDirChanged: onBackupDirChanged,
+          onShowRestorePicker: onShowRestorePicker,
+          onOpenCustomEnginesManager: onOpenCustomEnginesManager,
+          onSave: onSave,
+        ),
       ),
-    ).then((_) {
-      keyCtrl.dispose();
-      proxyCtrl.dispose();
-    });
+    );
   }
 
-  // 2. 自定义 TTS 引擎管理中心 (增删改、模板、cURL导入、JSON代码直编、分引擎直连/代理)
+  // 2. 自定义 TTS 引擎管理中心 (支持 3 态网络类型：直连 / 系统代理 / 自定义端口)
   static Future<void> showCustomEnginesDialog({
     required BuildContext context,
     required List<CustomTtsEngineConfig> customEngines,
@@ -715,11 +991,13 @@ class ReaderDialogs {
             responseType: 'raw_bytes',
             voices: {'default': '默认音色'},
             networkMode: 'direct',
+            customProxy: '',
           );
 
       final nameCtrl = TextEditingController(text: draft.name);
       final urlCtrl = TextEditingController(text: draft.url);
       final keyCtrl = TextEditingController(text: draft.apiKey);
+      final customProxyCtrl = TextEditingController(text: draft.customProxy);
       final headersCtrl = TextEditingController(text: const JsonEncoder.withIndent('  ').convert(draft.headers));
       final bodyCtrl = TextEditingController(text: draft.bodyTemplate);
       final jsonPathCtrl = TextEditingController(text: draft.jsonPath);
@@ -731,8 +1009,8 @@ class ReaderDialogs {
 
       String method = draft.method;
       String responseType = draft.responseType;
-      String networkMode = draft.networkMode;
-      int editorMode = 0; // 0: 表单配置  1: JSON 代码直编
+      String networkMode = normalizeEngineNetworkMode(draft.networkMode);
+      int editorMode = 0;
       String testResultMsg = "";
       bool isTesting = false;
       bool disposed = false;
@@ -774,6 +1052,7 @@ class ReaderDialogs {
           apiKey: keyCtrl.text.trim(),
           voices: parsedVoices,
           networkMode: networkMode,
+          customProxy: normalizeProxyInput(customProxyCtrl.text),
         );
       }
 
@@ -782,13 +1061,14 @@ class ReaderDialogs {
         nameCtrl.text = cfg.name;
         urlCtrl.text = cfg.url;
         keyCtrl.text = cfg.apiKey;
+        customProxyCtrl.text = cfg.customProxy;
         headersCtrl.text = const JsonEncoder.withIndent('  ').convert(cfg.headers);
         bodyCtrl.text = cfg.bodyTemplate;
         jsonPathCtrl.text = cfg.jsonPath;
         voicesCtrl.text = cfg.voices.entries.map((e) => '${e.key}=${e.value}').join('\n');
         method = cfg.method;
         responseType = cfg.responseType;
-        networkMode = cfg.networkMode;
+        networkMode = normalizeEngineNetworkMode(cfg.networkMode);
         rawCodeCtrl.text = cfg.toPrettyCode();
       }
 
@@ -799,6 +1079,7 @@ class ReaderDialogs {
             final templates = CustomTtsRunner.presetTemplates();
 
             return AlertDialog(
+              insetPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 14),
               title: Row(
                 children: [
                   const Icon(Icons.code, color: Color(0xFFC87D2E)),
@@ -807,13 +1088,12 @@ class ReaderDialogs {
                 ],
               ),
               content: SizedBox(
-                width: min(620.0, screenW * 0.94),
-                height: min(600.0, screenH * 0.8),
+                width: min(640.0, screenW - 20),
+                height: min(620.0, screenH * 0.82),
                 child: SingleChildScrollView(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      // 模式切换 + 快速导入预设模板 / cURL
                       Wrap(
                         spacing: 8,
                         runSpacing: 8,
@@ -854,9 +1134,9 @@ class ReaderDialogs {
                             itemBuilder: (_) => templates.entries
                                 .map((e) => PopupMenuItem(value: e.key, child: Text("载入模板：${e.value.name}")))
                                 .toList(),
-                            child: Chip(
-                              avatar: const Icon(Icons.auto_fix_high, size: 16, color: Color(0xFFC87D2E)),
-                              label: const Text("插入预设模板", style: TextStyle(fontSize: 11.5)),
+                            child: const Chip(
+                              avatar: Icon(Icons.auto_fix_high, size: 16, color: Color(0xFFC87D2E)),
+                              label: Text("插入预设模板", style: TextStyle(fontSize: 11.5)),
                             ),
                           ),
                           ActionChip(
@@ -912,28 +1192,34 @@ class ReaderDialogs {
                       const SizedBox(height: 10),
 
                       if (editorMode == 0) ...[
-                        Row(
-                          children: [
-                            Expanded(
-                              flex: 2,
-                              child: TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "引擎名称", isDense: true)),
-                            ),
-                            const SizedBox(width: 10),
-                            Expanded(
-                              child: DropdownButtonFormField<String>(
-                                value: networkMode,
-                                decoration: const InputDecoration(labelText: "网络连接", isDense: true),
-                                items: const [
-                                  DropdownMenuItem(value: 'direct', child: Text("直连 (默认)")),
-                                  DropdownMenuItem(value: 'proxy', child: Text("走代理")),
-                                ],
-                                onChanged: (v) {
-                                  if (v != null) setEditState(() => networkMode = v);
-                                },
-                              ),
-                            ),
-                          ],
+                        TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "引擎名称", isDense: true)),
+                        const SizedBox(height: 10),
+                        const Text("网络连接方式:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 6),
+                        SizedBox(
+                          width: double.infinity,
+                          child: SegmentedButton<String>(
+                            style: SegmentedButton.styleFrom(visualDensity: VisualDensity.compact),
+                            segments: const [
+                              ButtonSegment(value: 'direct', label: Text('直连', style: TextStyle(fontSize: 11.5))),
+                              ButtonSegment(value: 'system', label: Text('系统代理', style: TextStyle(fontSize: 11.5))),
+                              ButtonSegment(value: 'custom', label: Text('自定端口', style: TextStyle(fontSize: 11.5))),
+                            ],
+                            selected: {networkMode},
+                            onSelectionChanged: (v) => setEditState(() => networkMode = v.first),
+                          ),
                         ),
+                        if (networkMode == 'custom') ...[
+                          const SizedBox(height: 8),
+                          TextField(
+                            controller: customProxyCtrl,
+                            decoration: const InputDecoration(
+                              labelText: "自定义代理端口/地址",
+                              hintText: "如 127.0.0.1:7890 或仅填 7890",
+                              isDense: true,
+                            ),
+                          ),
+                        ],
                         const SizedBox(height: 8),
                         Row(
                           children: [
@@ -976,33 +1262,25 @@ class ReaderDialogs {
                           ),
                         ],
                         const SizedBox(height: 8),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: DropdownButtonFormField<String>(
-                                value: responseType,
-                                decoration: const InputDecoration(labelText: "返回音频格式", isDense: true),
-                                items: const [
-                                  DropdownMenuItem(value: 'raw_bytes', child: Text("直接返回 MP3/音频裸流")),
-                                  DropdownMenuItem(value: 'json_base64', child: Text("JSON 含 Base64 字段")),
-                                  DropdownMenuItem(value: 'json_url', child: Text("JSON 含音频下载 URL")),
-                                ],
-                                onChanged: (v) {
-                                  if (v != null) setEditState(() => responseType = v);
-                                },
-                              ),
-                            ),
-                            if (responseType != 'raw_bytes') ...[
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: TextField(
-                                  controller: jsonPathCtrl,
-                                  decoration: const InputDecoration(labelText: "JSON 提取路径 (如 data.audio)", isDense: true),
-                                ),
-                              ),
-                            ],
+                        DropdownButtonFormField<String>(
+                          value: responseType,
+                          decoration: const InputDecoration(labelText: "返回音频格式", isDense: true),
+                          items: const [
+                            DropdownMenuItem(value: 'raw_bytes', child: Text("直接返回 MP3/音频裸流")),
+                            DropdownMenuItem(value: 'json_base64', child: Text("JSON 含 Base64 字段")),
+                            DropdownMenuItem(value: 'json_url', child: Text("JSON 含音频下载 URL")),
                           ],
+                          onChanged: (v) {
+                            if (v != null) setEditState(() => responseType = v);
+                          },
                         ),
+                        if (responseType != 'raw_bytes') ...[
+                          const SizedBox(height: 8),
+                          TextField(
+                            controller: jsonPathCtrl,
+                            decoration: const InputDecoration(labelText: "JSON 提取路径 (如 choices[0].message.audio.data)", isDense: true),
+                          ),
+                        ],
                         const SizedBox(height: 8),
                         TextField(
                           controller: voicesCtrl,
@@ -1064,7 +1342,7 @@ class ReaderDialogs {
                           }
                           setEditState(() {
                             isTesting = true;
-                            testResultMsg = "正在发起测试请求 (${candidate!.networkMode == 'proxy' ? '代理' : '直连'})...";
+                            testResultMsg = "正在发起测试请求 (${candidate!.networkMode})...";
                           });
                           final client = networkRouter.getClientForEngine(candidate.id, [candidate]);
                           final res = await CustomTtsRunner.testConnectivity(candidate, client);
@@ -1120,6 +1398,7 @@ class ReaderDialogs {
         nameCtrl.dispose();
         urlCtrl.dispose();
         keyCtrl.dispose();
+        customProxyCtrl.dispose();
         headersCtrl.dispose();
         bodyCtrl.dispose();
         jsonPathCtrl.dispose();
@@ -1129,10 +1408,17 @@ class ReaderDialogs {
       });
     }
 
+    String routeLabel(CustomTtsEngineConfig cfg) {
+      if (cfg.networkMode == 'system') return '系统代理';
+      if (cfg.networkMode == 'custom') return '自定(${cfg.customProxy.isEmpty ? "未设" : cfg.customProxy})';
+      return '直连';
+    }
+
     return showDialog(
       context: context,
       builder: (dlgCtx) => StatefulBuilder(
         builder: (ctx, setDlgState) => AlertDialog(
+          insetPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 16),
           title: Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
@@ -1149,8 +1435,8 @@ class ReaderDialogs {
             ],
           ),
           content: SizedBox(
-            width: min(560.0, screenW * 0.92),
-            height: min(460.0, screenH * 0.68),
+            width: min(600.0, screenW - 20),
+            height: min(500.0, screenH * 0.72),
             child: customEngines.isEmpty
                 ? const Center(
                     child: Text(
@@ -1170,13 +1456,13 @@ class ReaderDialogs {
                         selected: isCur,
                         selectedTileColor: const Color(0xFFEFE7D2),
                         leading: Icon(
-                          cfg.networkMode == 'proxy' ? Icons.vpn_lock : Icons.public,
+                          cfg.networkMode == 'direct' ? Icons.public : Icons.vpn_lock,
                           color: isCur ? const Color(0xFFC87D2E) : Colors.blueGrey,
                           size: 20,
                         ),
                         title: Text(cfg.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
                         subtitle: Text(
-                          "${cfg.method} · ${cfg.networkMode == 'proxy' ? '走代理' : '直连'} · ${cfg.voices.length} 音色\n${cfg.url}",
+                          "${cfg.method} · ${routeLabel(cfg)} · ${cfg.voices.length} 音色\n${cfg.url}",
                           maxLines: 2,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(fontSize: 10.5, color: Colors.blueGrey),
@@ -1237,7 +1523,7 @@ class ReaderDialogs {
     );
   }
 
-  // 3. 发音人管理与试听中心 (支持微软 / Fish / 所有自定义引擎，Tab 切换不污染主界面)
+  // 3. 发音人管理与试听中心
   static void showVoiceManagerDialog({
     required BuildContext context,
     required String currentEngine,
@@ -1265,7 +1551,7 @@ class ReaderDialogs {
 
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
-    final dialogWidth = min(580.0, screenWidth * 0.94);
+    final dialogWidth = min(620.0, screenWidth - 20);
     final dialogHeight = min(660.0, screenHeight * 0.85);
 
     Map<String, String> getMapFor(String engId) {
@@ -1401,15 +1687,16 @@ class ReaderDialogs {
           }
 
           return AlertDialog(
+            insetPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 16),
             titlePadding: const EdgeInsets.fromLTRB(18, 14, 18, 0),
-            contentPadding: const EdgeInsets.fromLTRB(14, 10, 14, 10),
+            contentPadding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
             title: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 const Row(children: [
                   Icon(Icons.record_voice_over, color: Color(0xFFC87D2E)),
                   SizedBox(width: 8),
-                  Text("发音人与试听中心", style: TextStyle(fontSize: 16)),
+                  Text("发音人与试听", style: TextStyle(fontSize: 16)),
                 ]),
                 Row(
                   children: [
@@ -1437,7 +1724,6 @@ class ReaderDialogs {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // 水平引擎切换 Chip 栏（点击仅切换预览列表，不篡改正在朗读的引擎）
                   SingleChildScrollView(
                     scrollDirection: Axis.horizontal,
                     child: Row(
@@ -1756,7 +2042,7 @@ class ReaderDialogs {
     );
   }
 
-  // 5. 运行日志管理界面 (懒加载 ListView.builder，适配 2MB 轮转机制)
+  // 5. 运行日志管理界面 (支持 3 层级 error / info / all 与分级着色)
   static void showLogViewerDialog({
     required BuildContext context,
     required Function(String newLevel) onLogLevelChanged,
@@ -1767,15 +2053,16 @@ class ReaderDialogs {
 
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
-    final dialogWidth = min(740.0, screenWidth * 0.94);
-    final dialogHeight = min(620.0, screenHeight * 0.85);
+    final dialogWidth = min(740.0, screenWidth - 20);
+    final dialogHeight = min(640.0, screenHeight * 0.85);
 
     showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDlg) => AlertDialog(
-          titlePadding: const EdgeInsets.fromLTRB(20, 16, 20, 0),
-          contentPadding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+          insetPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 16),
+          titlePadding: const EdgeInsets.fromLTRB(18, 14, 18, 0),
+          contentPadding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
           title: Row(
             children: [
               const Icon(Icons.terminal, color: Color(0xFFC87D2E)),
@@ -1791,39 +2078,39 @@ class ReaderDialogs {
             child: Column(
               children: [
                 Container(
+                  width: double.infinity,
                   padding: const EdgeInsets.all(8),
                   decoration: BoxDecoration(color: const Color(0xFFEFE7D2), borderRadius: BorderRadius.circular(8)),
-                  child: Wrap(
-                    alignment: WrapAlignment.spaceBetween,
-                    crossAxisAlignment: WrapCrossAlignment.center,
-                    spacing: 8,
-                    runSpacing: 8,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Text("记录模式: ", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
-                          SegmentedButton<String>(
-                            style: SegmentedButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 6)),
-                            segments: const [
-                              ButtonSegment(value: 'error', label: Text('仅错误', style: TextStyle(fontSize: 11))),
-                              ButtonSegment(value: 'all', label: Text('详细流水', style: TextStyle(fontSize: 11))),
-                            ],
-                            selected: {AppLogger.logLevel},
-                            onSelectionChanged: (val) async {
-                              final newLevel = val.first;
-                              AppLogger.logLevel = newLevel;
-                              onLogLevelChanged(newLevel);
-                              AppLogger.log("日志记录模式已切换为: ${newLevel == 'all' ? '详细流水' : '仅记录错误'}", null, null, true);
-                              logLines = await AppLogger.readLogLines(maxLines: 800);
-                              logSizeBytes = await AppLogger.getLogSizeBytes();
-                              setDlg(() {});
-                            },
-                          ),
-                        ],
+                      const Text("记录层级:", style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 6),
+                      SizedBox(
+                        width: double.infinity,
+                        child: SegmentedButton<String>(
+                          style: SegmentedButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 4)),
+                          segments: const [
+                            ButtonSegment(value: 'error', label: Text('仅错误', style: TextStyle(fontSize: 11))),
+                            ButtonSegment(value: 'info', label: Text('重要事件', style: TextStyle(fontSize: 11))),
+                            ButtonSegment(value: 'all', label: Text('全量调试', style: TextStyle(fontSize: 11))),
+                          ],
+                          selected: {AppLogger.normalizeLevel(AppLogger.logLevel)},
+                          onSelectionChanged: (val) async {
+                            final newLevel = val.first;
+                            AppLogger.logLevel = newLevel;
+                            onLogLevelChanged(newLevel);
+                            AppLogger.log("日志记录层级切换为: $newLevel", null, null, true);
+                            logLines = await AppLogger.readLogLines(maxLines: 800);
+                            logSizeBytes = await AppLogger.getLogSizeBytes();
+                            setDlg(() {});
+                          },
+                        ),
                       ),
-                      Row(
-                        mainAxisSize: MainAxisSize.min,
+                      const SizedBox(height: 8),
+                      Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
                         children: [
                           OutlinedButton.icon(
                             style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 8)),
@@ -1835,7 +2122,6 @@ class ReaderDialogs {
                               setDlg(() {});
                             },
                           ),
-                          const SizedBox(width: 6),
                           OutlinedButton.icon(
                             style: OutlinedButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 8)),
                             icon: const Icon(Icons.copy, size: 15),
@@ -1845,7 +2131,6 @@ class ReaderDialogs {
                               ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("日志已复制到剪贴板")));
                             },
                           ),
-                          const SizedBox(width: 6),
                           FilledButton.tonalIcon(
                             style: FilledButton.styleFrom(
                               visualDensity: VisualDensity.compact,
@@ -1893,7 +2178,8 @@ class ReaderDialogs {
                     child: logLines.isEmpty
                         ? const Center(
                             child: Text(
-                              "(当前日志为空，可将模式切换为「详细流水」查看实时运转记录)",
+                              "(当前日志为空，可将层级切换为「重要事件」或「全量调试」查看详细流水)",
+                              textAlign: TextAlign.center,
                               style: TextStyle(color: Colors.grey, fontSize: 12),
                             ),
                           )
@@ -1905,7 +2191,9 @@ class ReaderDialogs {
                                 Color textColor = const Color(0xFFD4D4D4);
                                 if (line.contains('[ERROR]')) {
                                   textColor = const Color(0xFFFF6B6B);
-                                } else if (line.contains('[INFO]')) {
+                                } else if (line.contains('[EVENT]')) {
+                                  textColor = const Color(0xFFFFD43B);
+                                } else if (line.contains('[DEBUG]') || line.contains('[INFO]')) {
                                   textColor = const Color(0xFF69DB7C);
                                 }
                                 return Text(
@@ -1928,27 +2216,48 @@ class ReaderDialogs {
     );
   }
 
-  // 6. 备份文件历史恢复选择器
-  static void showRestorePicker({
+  // 6. 备份文件历史恢复选择器 (多行完整展示长文件名，宽屏不截断)
+  static Future<bool> showRestorePicker({
     required BuildContext context,
     required String lastBackupDir,
-    required Function(String path) onRestoreFile,
-  }) {
-    showDialog(
+    required Future<bool> Function(String path) onRestoreFile,
+  }) async {
+    final screenWidth = MediaQuery.of(context).size.width;
+    final screenHeight = MediaQuery.of(context).size.height;
+
+    final result = await showDialog<bool>(
       context: context,
       builder: (pickerCtx) => FutureBuilder<List<File>>(
         future: _getAvailableBackups(lastBackupDir),
         builder: (context, snapshot) {
           final files = snapshot.data ?? [];
           return AlertDialog(
-            title: const Text('选择备份文件恢复'),
+            insetPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 16),
+            titlePadding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+            contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+            title: const Row(
+              children: [
+                Icon(Icons.settings_backup_restore, color: Color(0xFFC87D2E)),
+                SizedBox(width: 8),
+                Text('选择备份文件恢复', style: TextStyle(fontSize: 16)),
+              ],
+            ),
             content: SizedBox(
-              width: 440,
-              height: 380,
+              width: min(640.0, screenWidth - 20),
+              height: min(560.0, screenHeight * 0.78),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text('当前备份目录: $lastBackupDir', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(color: const Color(0xFFEFE7D2), borderRadius: BorderRadius.circular(6)),
+                    child: Text(
+                      '备份目录: $lastBackupDir',
+                      softWrap: true,
+                      style: const TextStyle(fontSize: 11.5, color: Color(0xFF743C00)),
+                    ),
+                  ),
                   const SizedBox(height: 8),
                   const Divider(height: 1),
                   Expanded(
@@ -1956,20 +2265,40 @@ class ReaderDialogs {
                         ? const Center(child: CircularProgressIndicator())
                         : files.isEmpty
                             ? const Center(child: Text('当前备份目录中没有发现 .json 备份\n可点击下方从其他路径选择', textAlign: TextAlign.center))
-                            : ListView.builder(
+                            : ListView.separated(
                                 itemCount: files.length,
+                                separatorBuilder: (_, __) => const Divider(height: 1, color: Color(0xFFECE7D9)),
                                 itemBuilder: (ctx, index) {
                                   final f = files[index];
                                   final name = f.path.split(Platform.pathSeparator).last;
-                                  final sizeKb = (f.lengthSync() / 1024).toStringAsFixed(1);
+                                  String meta = "";
+                                  try {
+                                    final stat = f.statSync();
+                                    final sizeKb = (stat.size / 1024).toStringAsFixed(1);
+                                    final dt = stat.modified.toLocal();
+                                    final dateStr =
+                                        "${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}";
+                                    meta = "$sizeKb KB · $dateStr";
+                                  } catch (_) {}
+
                                   return ListTile(
                                     dense: true,
-                                    leading: const Icon(Icons.settings_backup_restore, color: Color(0xFFC87D2E)),
-                                    title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
-                                    subtitle: Text('大小：$sizeKb KB'),
-                                    onTap: () {
-                                      Navigator.pop(pickerCtx);
-                                      onRestoreFile(f.path);
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+                                    leading: const Icon(Icons.description_outlined, color: Color(0xFFC87D2E), size: 26),
+                                    title: Text(
+                                      name,
+                                      softWrap: true,
+                                      style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, height: 1.35),
+                                    ),
+                                    subtitle: meta.isNotEmpty
+                                        ? Padding(
+                                            padding: const EdgeInsets.only(top: 4),
+                                            child: Text(meta, style: const TextStyle(fontSize: 11, color: Colors.blueGrey)),
+                                          )
+                                        : null,
+                                    onTap: () async {
+                                      final ok = await onRestoreFile(f.path);
+                                      if (pickerCtx.mounted) Navigator.pop(pickerCtx, ok);
                                     },
                                   );
                                 },
@@ -1977,31 +2306,36 @@ class ReaderDialogs {
                   ),
                   const Divider(height: 1),
                   const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  Wrap(
+                    alignment: WrapAlignment.spaceEvenly,
+                    spacing: 12,
                     children: [
                       TextButton.icon(
                         icon: const Icon(Icons.folder_open),
                         label: const Text('物理浏览选择'),
                         onPressed: () async {
-                          Navigator.pop(pickerCtx);
                           final path = await StorageHelper.browseSharedStorage(
                             context,
                             chooseDirectory: false,
                             extensions: ['json'],
                             initialPath: lastBackupDir,
                           );
-                          if (path != null) onRestoreFile(path);
+                          if (path != null) {
+                            final ok = await onRestoreFile(path);
+                            if (pickerCtx.mounted) Navigator.pop(pickerCtx, ok);
+                          }
                         },
                       ),
                       TextButton.icon(
                         icon: const Icon(Icons.file_open),
                         label: const Text('系统选择器'),
                         onPressed: () async {
-                          Navigator.pop(pickerCtx);
                           final res = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['json']);
                           final p = res?.files.single.path;
-                          if (p != null) onRestoreFile(p);
+                          if (p != null) {
+                            final ok = await onRestoreFile(p);
+                            if (pickerCtx.mounted) Navigator.pop(pickerCtx, ok);
+                          }
                         },
                       ),
                     ],
@@ -2009,11 +2343,12 @@ class ReaderDialogs {
                 ],
               ),
             ),
-            actions: [TextButton(onPressed: () => Navigator.pop(pickerCtx), child: const Text('取消'))],
+            actions: [TextButton(onPressed: () => Navigator.pop(pickerCtx, false), child: const Text('取消'))],
           );
         },
       ),
     );
+    return result ?? false;
   }
 
   static Future<List<File>> _getAvailableBackups(String backupFolderPath) async {
@@ -2033,7 +2368,7 @@ class ReaderDialogs {
     }
   }
 
-  // 7. 批量合并 MP3 导出弹窗 (修复 hostContext 遮蔽，支持自定义引擎)
+  // 7. 批量合并 MP3 导出弹窗
   static void openExportDialog({
     required BuildContext hostContext,
     required ExportController exportController,
@@ -2102,13 +2437,14 @@ class ReaderDialogs {
           return ListenableBuilder(
             listenable: exportController,
             builder: (listCtx, _) => AlertDialog(
+              insetPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 16),
               title: const Row(children: [
                 Icon(Icons.audio_file_outlined, color: Color(0xFFC87D2E)),
                 SizedBox(width: 8),
                 Text("批量合并导出 MP3"),
               ]),
               content: SizedBox(
-                width: min(520.0, MediaQuery.of(innerCtx).size.width * 0.9),
+                width: min(540.0, MediaQuery.of(innerCtx).size.width - 20),
                 child: SingleChildScrollView(
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
