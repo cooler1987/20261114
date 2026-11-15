@@ -15,7 +15,7 @@ import 'models.dart';
 import 'system_utils.dart';
 import 'tts_engines.dart';
 
-// ────────────────── 离线 MP3 导出状态控制器 (滑动并发池 + 自动重试 + 流式落盘合并) ──────────────────
+// ────────────────── 离线 MP3 导出状态控制器 (前置校验 + Xing清洗合并 + 失败片段保留重试) ──────────────────
 class ExportController extends ChangeNotifier {
   bool isExporting = false;
   double progress = 0.0;
@@ -30,6 +30,41 @@ class ExportController extends ChangeNotifier {
   Stopwatch? _stopwatch;
   Timer? _ticker;
 
+  // 失败片段续传重试上下文
+  Directory? _lastChunkDir;
+  List<bool> _lastChunkOk = [];
+  List<int> _lastFailedTaskIndices = [];
+  List<String> _lastSliceTexts = [];
+  String _lastOutDir = '';
+  String _lastFileNamePrefix = '';
+  String _lastExportEngine = 'ms';
+  String _lastExportVoiceId = '';
+  double _lastExportSpeed = 1.0;
+  int _lastExportBitrate = 64;
+  int _lastExportThreads = 6;
+  int _lastTimeoutSeconds = 60;
+  FishAudioTTS? _lastFishTts;
+  List<CustomTtsEngineConfig> _lastCustomEngines = [];
+  TtsNetworkRouter? _lastNetworkRouter;
+
+  bool get hasRetryableFailures =>
+      !isExporting && _lastFailedTaskIndices.isNotEmpty && _lastChunkDir != null && _lastChunkDir!.existsSync();
+
+  int get retryableFailureCount => _lastFailedTaskIndices.length;
+
+  void clearRetryCache() {
+    try {
+      if (_lastChunkDir != null && _lastChunkDir!.existsSync()) {
+        _lastChunkDir!.deleteSync(recursive: true);
+      }
+    } catch (_) {}
+    _lastChunkDir = null;
+    _lastChunkOk = [];
+    _lastFailedTaskIndices = [];
+    _lastSliceTexts = [];
+    notifyListeners();
+  }
+
   void cancel() {
     cancelFlag = true;
     AppLogger.log("用户主动取消了 MP3 导出任务", null, null, true);
@@ -37,7 +72,6 @@ class ExportController extends ChangeNotifier {
   }
 
   Future<void> startBackgroundExport({
-    required BuildContext hostContext,
     required List<TextSliceNode> nodes,
     required int sIdx,
     required int eIdx,
@@ -54,12 +88,58 @@ class ExportController extends ChangeNotifier {
     required TtsNetworkRouter networkRouter,
   }) async {
     if (isExporting) return;
+
+    // 前置校验：避免启动并发池后白白失败
+    if (exportEngine == 'fish' && fishTts.apiKey.trim().isEmpty) {
+      AppToast.show("导出中止：请先填写 Fish Audio API Key", isError: true);
+      return;
+    }
+    if (outDir.trim().isEmpty) {
+      AppToast.show("导出中止：保存目录不能为空", isError: true);
+      return;
+    }
     if (!await StorageHelper.checkAndRequestManagePermission()) return;
 
     final int count = eIdx - sIdx;
     if (count <= 0) return;
 
-    AppLogger.log("启动 MP3 批量导出 [范围: ${sIdx + 1}..$eIdx (共 $count 单元), 引擎: $exportEngine, 并发: $exportThreads]", null, null, true);
+    clearRetryCache();
+
+    _lastSliceTexts = List.generate(count, (i) => nodes[sIdx + i].text);
+    _lastOutDir = outDir.trim();
+    _lastFileNamePrefix = fileNamePrefix;
+    _lastExportEngine = exportEngine;
+    _lastExportVoiceId = exportVoiceId;
+    _lastExportSpeed = exportSpeed;
+    _lastExportBitrate = exportBitrate;
+    _lastExportThreads = exportThreads;
+    _lastTimeoutSeconds = timeoutSeconds;
+    _lastFishTts = fishTts;
+    _lastCustomEngines = customEngines;
+    _lastNetworkRouter = networkRouter;
+
+    final tempRoot = await getTemporaryDirectory();
+    _lastChunkDir = Directory("${tempRoot.path}${Platform.pathSeparator}mp3_export_${DateTime.now().millisecondsSinceEpoch}");
+    await _lastChunkDir!.create(recursive: true);
+    _lastChunkOk = List.filled(count, false);
+
+    final tasks = List.generate(count, (i) => i);
+    await _runBatchTasks(tasks, isRetry: false);
+  }
+
+  Future<void> retryFailedChunks() async {
+    if (!hasRetryableFailures) return;
+    final tasks = List<int>.from(_lastFailedTaskIndices);
+    await _runBatchTasks(tasks, isRetry: true);
+  }
+
+  Future<void> _runBatchTasks(List<int> taskIndices, {required bool isRetry}) async {
+    final chunkDir = _lastChunkDir;
+    final networkRouter = _lastNetworkRouter;
+    final fishTts = _lastFishTts;
+    if (chunkDir == null || networkRouter == null || fishTts == null || taskIndices.isEmpty) return;
+
+    AppLogger.log("${isRetry ? '仅重试失败导出切片' : '启动 MP3 批量导出'} [待处理:${taskIndices.length}项, 引擎:$_lastExportEngine]", null, null, true);
 
     _stopwatch = Stopwatch()..start();
     _ticker?.cancel();
@@ -72,65 +152,64 @@ class ExportController extends ChangeNotifier {
     isExporting = true;
     progress = 0.0;
     done = 0;
-    successCount = 0;
+    successCount = _lastChunkOk.where((ok) => ok).length;
     failedCount = 0;
-    total = count;
-    status = "正在准备临时目录与并发池...";
+    total = taskIndices.length;
+    status = isRetry ? "正在重抓失败切片..." : "正在准备并发抓取池...";
     cancelFlag = false;
     notifyListeners();
 
-    final tempRoot = await getTemporaryDirectory();
-    final chunkDir = Directory("${tempRoot.path}${Platform.pathSeparator}mp3_export_${DateTime.now().millisecondsSinceEpoch}");
-    await chunkDir.create(recursive: true);
-
-    final List<bool> chunkOk = List.filled(count, false);
     int nextCursor = 0;
-    final int workerCount = min(exportThreads.clamp(1, 16), count);
+    final List<int> newFailed = [];
+    final int workerCount = min(_lastExportThreads.clamp(1, 16), taskIndices.length);
 
     Future<void> runWorker() async {
       while (!cancelFlag) {
-        final int taskIdx = nextCursor++;
-        if (taskIdx >= count) break;
-        final int pIdx = sIdx + taskIdx;
+        final int pos = nextCursor++;
+        if (pos >= taskIndices.length) break;
+        final int taskIdx = taskIndices[pos];
+        final String text = _lastSliceTexts[taskIdx];
 
         Uint8List? audioBytes;
         for (int attempt = 0; attempt < 3; attempt++) {
           if (cancelFlag) break;
           try {
             audioBytes = await synthesizeWithEngine(
-              engineId: exportEngine,
-              text: nodes[pIdx].text,
-              voiceId: exportVoiceId,
-              speed: exportSpeed,
-              bitrate: exportBitrate,
-              timeoutSeconds: timeoutSeconds,
+              engineId: _lastExportEngine,
+              text: text,
+              voiceId: _lastExportVoiceId,
+              speed: _lastExportSpeed,
+              bitrate: _lastExportBitrate,
+              timeoutSeconds: _lastTimeoutSeconds,
               fishTts: fishTts,
-              customEngines: customEngines,
+              customEngines: _lastCustomEngines,
               networkRouter: networkRouter,
             );
             break;
           } catch (e) {
             if (attempt == 2) {
-              AppLogger.log("导出切片 #${pIdx + 1} 经 3 次尝试后失败", e);
+              AppLogger.log("导出切片 #${taskIdx + 1} 经 3 次尝试后失败", e);
             } else {
-              await Future.delayed(Duration(milliseconds: 350 * (attempt + 1)));
+              await Future.delayed(Duration(milliseconds: 400 * (attempt + 1)));
             }
           }
         }
 
         if (audioBytes != null && audioBytes.isNotEmpty && !cancelFlag) {
-          final cleaned = stripId3Tags(audioBytes);
-          final chunkFile = File("${chunkDir.path}${Platform.pathSeparator}${taskIdx.toString().padLeft(6, '0')}.mp3");
+          final isWav = Mp3MergeHelper.isWavData(audioBytes);
+          final cleaned = isWav ? audioBytes : Mp3MergeHelper.cleanMp3Chunk(audioBytes);
+          final chunkFile = File("${chunkDir.path}${Platform.pathSeparator}${taskIdx.toString().padLeft(6, '0')}.chunk");
           await chunkFile.writeAsBytes(cleaned, flush: false);
-          chunkOk[taskIdx] = true;
+          _lastChunkOk[taskIdx] = true;
           successCount++;
         } else if (!cancelFlag) {
+          newFailed.add(taskIdx);
           failedCount++;
         }
 
         done++;
-        progress = done / count;
-        status = "已完成 $done/$count (成功:$successCount 失败:$failedCount)";
+        progress = done / total;
+        status = "本轮 $done/$total (累计成功:$successCount 失败:$failedCount)";
         notifyListeners();
       }
     }
@@ -139,75 +218,114 @@ class ExportController extends ChangeNotifier {
 
     _stopwatch?.stop();
     _ticker?.cancel();
+    _lastFailedTaskIndices = newFailed..sort();
 
     if (cancelFlag) {
-      try {
-        if (await chunkDir.exists()) await chunkDir.delete(recursive: true);
-      } catch (_) {}
+      clearRetryCache();
       isExporting = false;
       notifyListeners();
-      if (hostContext.mounted) {
-        ScaffoldMessenger.of(hostContext).showSnackBar(const SnackBar(content: Text("导出任务已取消")));
-      }
+      AppToast.show("导出任务已取消");
       return;
     }
 
     if (successCount == 0) {
-      try {
-        if (await chunkDir.exists()) await chunkDir.delete(recursive: true);
-      } catch (_) {}
       isExporting = false;
       notifyListeners();
-      if (hostContext.mounted) {
-        ScaffoldMessenger.of(hostContext).showSnackBar(const SnackBar(content: Text("导出失败：所有音频单元均合成失败，请检查网络或配置")));
-      }
+      AppToast.show("导出失败：所有音频单元均合成失败，可检查网络后重试", isError: true);
       return;
     }
 
-    final Directory targetDir = Directory(outDir.trim());
+    // 合并所有已成功切片
+    final Directory targetDir = Directory(_lastOutDir);
     if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
     final int totalSec = _stopwatch?.elapsed.inSeconds ?? 0;
     final String timeStr = totalSec >= 60 ? "${totalSec ~/ 60}分${totalSec % 60}秒" : "${totalSec}秒";
-    String safePrefix = fileNamePrefix.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
+    String safePrefix = _lastFileNamePrefix.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_');
     if (safePrefix.length > 80) safePrefix = safePrefix.substring(0, 80);
-    final String finalFileName = "${safePrefix}_耗时$timeStr.mp3";
 
+    // 检测首片是否为 WAV，决定输出封装与合并策略
+    bool isWavStream = false;
+    for (int i = 0; i < _lastChunkOk.length; i++) {
+      if (!_lastChunkOk[i]) continue;
+      final f = File("${chunkDir.path}${Platform.pathSeparator}${i.toString().padLeft(6, '0')}.chunk");
+      if (await f.exists()) {
+        final head = await f.openRead(0, 12).first;
+        isWavStream = Mp3MergeHelper.isWavData(Uint8List.fromList(head));
+        break;
+      }
+    }
+
+    final ext = isWavStream ? 'wav' : 'mp3';
+    final String finalFileName = "${safePrefix}_耗时$timeStr.$ext";
     final outFile = File("${targetDir.path}${Platform.pathSeparator}$finalFileName");
     final sink = outFile.openWrite();
-    for (int i = 0; i < count; i++) {
-      if (!chunkOk[i]) continue;
-      final f = File("${chunkDir.path}${Platform.pathSeparator}${i.toString().padLeft(6, '0')}.mp3");
-      if (await f.exists()) {
+
+    bool wroteFirstWav = false;
+    int totalWavDataBytes = 0;
+
+    for (int i = 0; i < _lastChunkOk.length; i++) {
+      if (!_lastChunkOk[i]) continue;
+      final f = File("${chunkDir.path}${Platform.pathSeparator}${i.toString().padLeft(6, '0')}.chunk");
+      if (!await f.exists()) continue;
+
+      if (isWavStream) {
+        final bytes = await f.readAsBytes();
+        final cleaned = Mp3MergeHelper.cleanWavChunk(bytes, keepHeader: !wroteFirstWav);
+        if (!wroteFirstWav) {
+          wroteFirstWav = true;
+          totalWavDataBytes += max(0, cleaned.length - 44);
+        } else {
+          totalWavDataBytes += cleaned.length;
+        }
+        sink.add(cleaned);
+      } else {
         await sink.addStream(f.openRead());
       }
     }
     await sink.flush();
     await sink.close();
 
-    try {
-      if (await chunkDir.exists()) await chunkDir.delete(recursive: true);
-    } catch (_) {}
+    // 若为 WAV 合并流，回写 RIFF 与 data 块总字节长度
+    if (isWavStream && await outFile.exists()) {
+      try {
+        final raf = await outFile.open(mode: FileMode.writeOnlyAppend);
+        final fileLen = await raf.length();
+        if (fileLen >= 44) {
+          final riffSize = fileLen - 8;
+          await raf.setPosition(4);
+          await raf.writeFrom([riffSize & 0xFF, (riffSize >> 8) & 0xFF, (riffSize >> 16) & 0xFF, (riffSize >> 24) & 0xFF]);
+          await raf.setPosition(40);
+          await raf.writeFrom([
+            totalWavDataBytes & 0xFF,
+            (totalWavDataBytes >> 8) & 0xFF,
+            (totalWavDataBytes >> 16) & 0xFF,
+            (totalWavDataBytes >> 24) & 0xFF,
+          ]);
+        }
+        await raf.close();
+      } catch (_) {}
+    }
 
-    AppLogger.log("MP3 导出合并完成: ${outFile.path} [耗时: $timeStr, 成功: $successCount/$count, 失败: $failedCount]", null, null, true);
+    final int totalAll = _lastChunkOk.length;
+    if (_lastFailedTaskIndices.isEmpty) {
+      clearRetryCache();
+    }
+
+    AppLogger.log("音频导出合并完成: ${outFile.path} [耗时:$timeStr, 成功:$successCount/$totalAll, 失败:${_lastFailedTaskIndices.length}]", null, null, true);
 
     isExporting = false;
     notifyListeners();
 
-    if (hostContext.mounted) {
-      final failTip = failedCount > 0 ? "\n⚠️ 有 $failedCount 句合成失败已跳过（详见运行日志）" : "";
-      ScaffoldMessenger.of(hostContext).showSnackBar(
-        SnackBar(
-          duration: const Duration(seconds: 10),
-          content: Text("🎉 合并完成！成功 $successCount/$count 单元 (耗时: $timeStr)$failTip\n保存至: ${outFile.path}"),
-          action: SnackBarAction(
-            label: "打开",
-            textColor: Colors.amber,
-            onPressed: () => OpenFilex.open(outFile.path),
-          ),
-        ),
-      );
-    }
+    final failTip = _lastFailedTaskIndices.isNotEmpty
+        ? "\n⚠️ 仍有 ${_lastFailedTaskIndices.length} 句失败（已在导出界面保留重试缓存）"
+        : "";
+    AppToast.show(
+      "🎉 合并完成！成功 $successCount/$totalAll 单元 ($timeStr)$failTip\n保存至: ${outFile.path}",
+      duration: const Duration(seconds: 7),
+      actionLabel: "打开",
+      onAction: () => OpenFilex.open(outFile.path),
+    );
   }
 
   @override
@@ -218,7 +336,7 @@ class ExportController extends ChangeNotifier {
   }
 }
 
-// ────────────────── 全屏自适应系统设置页 (移动端不局促 + 分引擎3态网络) ──────────────────
+// ────────────────── 全屏自适应系统设置页 ──────────────────
 class ReaderSettingsPage extends StatefulWidget {
   final String currentEngine;
   final String apiKey;
@@ -233,7 +351,12 @@ class ReaderSettingsPage extends StatefulWidget {
   final List<CustomTtsEngineConfig> customEngines;
   final bool followAlong;
   final String splitMode;
+  final int mergeMinChars;
   final double fontSize;
+  final double lineHeight;
+  final double horizontalPadding;
+  final String themeId;
+  final bool ignoreBadCert;
   final String logLevel;
   final String lastBackupDir;
 
@@ -253,9 +376,14 @@ class ReaderSettingsPage extends StatefulWidget {
     required int maxCacheCount,
     required Map<String, String> engineNetworkModes,
     required Map<String, String> engineCustomProxies,
+    required bool ignoreBadCert,
     required bool followAlong,
     required String splitMode,
+    required int mergeMinChars,
     required double fontSize,
+    required double lineHeight,
+    required double horizontalPadding,
+    required String themeId,
     required String logLevel,
   }) onSave;
 
@@ -274,7 +402,12 @@ class ReaderSettingsPage extends StatefulWidget {
     required this.customEngines,
     required this.followAlong,
     required this.splitMode,
+    required this.mergeMinChars,
     required this.fontSize,
+    required this.lineHeight,
+    required this.horizontalPadding,
+    required this.themeId,
+    required this.ignoreBadCert,
     required this.logLevel,
     required this.lastBackupDir,
     required this.onExportBackup,
@@ -300,7 +433,12 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
   late int _tempMaxCache;
   late bool _tempAutoScroll;
   late String _tempSplit;
+  late int _tempMergeMinChars;
   late double _tempFontSize;
+  late double _tempLineHeight;
+  late double _tempHorizontalPadding;
+  late String _tempThemeId;
+  late bool _tempIgnoreBadCert;
   late String _tempLogLevel;
   late String _tempBackupDir;
 
@@ -323,7 +461,12 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
     _tempMaxCache = widget.maxCacheCount;
     _tempAutoScroll = widget.followAlong;
     _tempSplit = widget.splitMode;
+    _tempMergeMinChars = widget.mergeMinChars.clamp(0, 120);
     _tempFontSize = widget.fontSize.clamp(10.0, 20.0);
+    _tempLineHeight = widget.lineHeight.clamp(1.4, 2.2);
+    _tempHorizontalPadding = widget.horizontalPadding.clamp(8.0, 40.0);
+    _tempThemeId = ReaderThemeConfig.byId(widget.themeId).id;
+    _tempIgnoreBadCert = widget.ignoreBadCert;
     _tempLogLevel = AppLogger.normalizeLevel(widget.logLevel);
     _tempBackupDir = widget.lastBackupDir;
     _showFishConfigAlways = _tempEngine == 'fish' || widget.apiKey.isNotEmpty;
@@ -419,7 +562,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
               child: Text(
                 widget.networkRouter.detectedSystemProxy?.isNotEmpty == true
                     ? "将使用系统代理: ${widget.networkRouter.detectedSystemProxy}"
-                    : "⚠️ 当前未检测到系统代理，将自动回退直连",
+                    : "⚠️ 当前未检测到系统代理，将自动回退直连（移动端建议使用自定端口）",
                 style: TextStyle(
                   fontSize: 11.5,
                   color: widget.networkRouter.detectedSystemProxy?.isNotEmpty == true ? Colors.teal.shade700 : Colors.orange.shade800,
@@ -450,9 +593,14 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
       maxCacheCount: _tempMaxCache,
       engineNetworkModes: _tempRoutes,
       engineCustomProxies: customProxies,
+      ignoreBadCert: _tempIgnoreBadCert,
       followAlong: _tempAutoScroll,
       splitMode: _tempSplit,
+      mergeMinChars: _tempMergeMinChars,
       fontSize: _tempFontSize,
+      lineHeight: _tempLineHeight,
+      horizontalPadding: _tempHorizontalPadding,
+      themeId: _tempThemeId,
       logLevel: _tempLogLevel,
     );
     if (mounted) Navigator.pop(context);
@@ -462,6 +610,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
   Widget build(BuildContext context) {
     final allEngineIds = <String>{'ms', 'fish', ...widget.customEngines.map((e) => e.id)};
     if (!allEngineIds.contains(_tempEngine)) _tempEngine = 'ms';
+    final previewTheme = ReaderThemeConfig.byId(_tempThemeId);
 
     return Scaffold(
       backgroundColor: const Color(0xFFF6F4EC),
@@ -636,6 +785,13 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                         _buildEngineRouteRow('ms', '微软官方引擎'),
                         _buildEngineRouteRow('fish', 'Fish Audio 官方引擎'),
                         for (final c in widget.customEngines) _buildEngineRouteRow(c.id, '🧩 ${c.name}'),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          title: const Text("忽略代理通道自签名 SSL 证书", style: TextStyle(fontSize: 13)),
+                          subtitle: const Text("默认关闭以保障安全；仅在使用抓包工具或特殊自签代理时开启", style: TextStyle(fontSize: 11, color: Colors.blueGrey)),
+                          value: _tempIgnoreBadCert,
+                          onChanged: (v) => setState(() => _tempIgnoreBadCert = v),
+                        ),
                       ],
                     ),
                   ),
@@ -643,7 +799,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
 
                 const SizedBox(height: 10),
 
-                // 3. 阅读字体与朗读规则
+                // 3. 阅读主题、排版与智能合并断句规则
                 Card(
                   color: const Color(0xFFFCFBF7),
                   elevation: 0.5,
@@ -653,7 +809,32 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _buildSectionTitle("📖 排版字体与朗读规则"),
+                        _buildSectionTitle("📖 主题、排版与智能合并断句"),
+                        const Text("阅读配色主题:", style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
+                        const SizedBox(height: 8),
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: ReaderThemeConfig.presets.map((t) {
+                            final selected = _tempThemeId == t.id;
+                            return ChoiceChip(
+                              avatar: CircleAvatar(
+                                backgroundColor: t.scaffoldBg,
+                                radius: 9,
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    border: Border.all(color: t.accent, width: 1.5),
+                                  ),
+                                ),
+                              ),
+                              label: Text(t.name, style: const TextStyle(fontSize: 12)),
+                              selected: selected,
+                              onSelected: (_) => setState(() => _tempThemeId = t.id),
+                            );
+                          }).toList(),
+                        ),
+                        const SizedBox(height: 12),
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
@@ -682,19 +863,65 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                           label: "${_tempFontSize.toStringAsFixed(1).replaceAll('.0', '')} px",
                           onChanged: (v) => setState(() => _tempFontSize = double.parse(v.toStringAsFixed(1))),
                         ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("正文行距倍数:"),
+                            Text("${_tempLineHeight.toStringAsFixed(2)}x", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempLineHeight,
+                          min: 1.4,
+                          max: 2.2,
+                          divisions: 16,
+                          label: "${_tempLineHeight.toStringAsFixed(2)}x",
+                          onChanged: (v) => setState(() => _tempLineHeight = double.parse(v.toStringAsFixed(2))),
+                        ),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Text("正文左右页边距:"),
+                            Text("${_tempHorizontalPadding.toInt()} px", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempHorizontalPadding,
+                          min: 8.0,
+                          max: 40.0,
+                          divisions: 16,
+                          label: "${_tempHorizontalPadding.toInt()} px",
+                          onChanged: (v) => setState(() => _tempHorizontalPadding = v.roundToDouble()),
+                        ),
                         Container(
                           width: double.infinity,
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                          margin: const EdgeInsets.only(bottom: 12),
-                          decoration: BoxDecoration(color: const Color(0xFFF6F4EC), borderRadius: BorderRadius.circular(8)),
-                          child: Text(
-                            "字体预览：春风拂槛露华浓，静听书声伴晚钟。",
-                            style: TextStyle(fontSize: _tempFontSize, color: const Color(0xFF2D2E2F), height: 1.6),
+                          padding: EdgeInsets.symmetric(horizontal: _tempHorizontalPadding, vertical: 10),
+                          margin: const EdgeInsets.only(bottom: 14),
+                          decoration: BoxDecoration(
+                            color: previewTheme.scaffoldBg,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: previewTheme.cardBorder),
+                          ),
+                          child: RichText(
+                            text: TextSpan(
+                              style: TextStyle(fontSize: _tempFontSize, color: previewTheme.primaryText, height: _tempLineHeight),
+                              children: [
+                                TextSpan(
+                                  text: "效果预览：春风拂槛露华浓，",
+                                  style: TextStyle(
+                                    backgroundColor: previewTheme.highlightBg,
+                                    color: previewTheme.highlightText,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                const TextSpan(text: "静听书声伴晚钟。自然段落内嵌句内高亮，阅读更连贯。"),
+                              ],
+                            ),
                           ),
                         ),
                         DropdownButtonFormField<String>(
                           value: _tempSplit,
-                          decoration: const InputDecoration(labelText: '朗读断句规则 (CharOffset 无缝定位)', isDense: true, border: OutlineInputBorder()),
+                          decoration: const InputDecoration(labelText: '朗读断句基础规则 (CharOffset 无缝定位)', isDense: true, border: OutlineInputBorder()),
                           items: const [
                             DropdownMenuItem(value: 'sentence', child: Text('按标点断句朗读 (推荐)')),
                             DropdownMenuItem(value: 'paragraph', child: Text('按自然段落朗读')),
@@ -703,7 +930,32 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                             if (v != null) setState(() => _tempSplit = v);
                           },
                         ),
-                        const SizedBox(height: 12),
+                        const SizedBox(height: 14),
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Expanded(
+                              child: Text("短句智能合并长度 (减少TTS请求次数):", style: TextStyle(fontSize: 13)),
+                            ),
+                            Text(
+                              _tempMergeMinChars == 0 ? "已关闭" : "≥ $_tempMergeMinChars 字",
+                              style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold),
+                            ),
+                          ],
+                        ),
+                        Slider(
+                          value: _tempMergeMinChars.toDouble(),
+                          min: 0,
+                          max: 120,
+                          divisions: 24,
+                          label: _tempMergeMinChars == 0 ? "关闭合并" : "≥ $_tempMergeMinChars 字",
+                          onChanged: (v) => setState(() => _tempMergeMinChars = ((v / 5).round() * 5).clamp(0, 120)),
+                        ),
+                        const Text(
+                          "说明：默认 30 字。连续短句或短对话将自动合并至超过设定字数再发往 TTS（不跨越章节边界，上限 280 字），设为 0 则逐句单发。",
+                          style: TextStyle(fontSize: 11, color: Colors.blueGrey, height: 1.35),
+                        ),
+                        const SizedBox(height: 10),
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
@@ -776,7 +1028,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
-                            const Text("音频内存最大缓存上限:"),
+                            const Text("音频内存最大缓存上限 (支持瞬时回听):"),
                             Text("$_tempMaxCache 句", style: const TextStyle(color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
                           ],
                         ),
@@ -861,7 +1113,6 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                               label: const Text("选择文件恢复"),
                               onPressed: () async {
                                 final restored = await widget.onShowRestorePicker();
-                                // 若已成功恢复，直接退出设置页防止点击“保存配置”用旧表单状态覆盖恢复数据
                                 if (restored && mounted) {
                                   Navigator.pop(context);
                                 }
@@ -893,6 +1144,78 @@ class ReaderDialogs {
     return engineId;
   }
 
+  /// 整章文本选择与复制浮窗（用于右键菜单“选择本章节”）
+  static void showChapterTextDialog({
+    required BuildContext context,
+    required String title,
+    required String text,
+    required ReaderThemeConfig theme,
+  }) {
+    final ctrl = TextEditingController(text: text);
+    ctrl.selection = TextSelection(baseOffset: 0, extentOffset: text.length);
+
+    final screenW = MediaQuery.of(context).size.width;
+    final screenH = MediaQuery.of(context).size.height;
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: theme.surfaceBg,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 18),
+        title: Row(
+          children: [
+            Icon(Icons.article_outlined, color: theme.accent, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                "章节文本：$title",
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 15, color: theme.primaryText, fontWeight: FontWeight.bold),
+              ),
+            ),
+          ],
+        ),
+        content: SizedBox(
+          width: min(640.0, screenW - 24),
+          height: min(560.0, screenH * 0.72),
+          child: TextField(
+            controller: ctrl,
+            readOnly: true,
+            autofocus: true,
+            maxLines: null,
+            expands: true,
+            style: TextStyle(fontSize: 14, height: 1.7, color: theme.primaryText),
+            decoration: InputDecoration(
+              filled: true,
+              fillColor: theme.scaffoldBg,
+              border: OutlineInputBorder(borderSide: BorderSide(color: theme.cardBorder)),
+              contentPadding: const EdgeInsets.all(12),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              ctrl.selection = TextSelection(baseOffset: 0, extentOffset: ctrl.text.length);
+            },
+            child: const Text("全选"),
+          ),
+          FilledButton.icon(
+            icon: const Icon(Icons.copy, size: 16),
+            label: const Text("复制整章"),
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: text));
+              Navigator.pop(ctx);
+              AppToast.show("已复制本章共 ${text.length} 字到剪贴板");
+            },
+          ),
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text("关闭")),
+        ],
+      ),
+    ).then((_) => ctrl.dispose());
+  }
+
   // 1. 打开全屏设置页
   static Future<void> openSettingsPage({
     required BuildContext context,
@@ -909,7 +1232,12 @@ class ReaderDialogs {
     required List<CustomTtsEngineConfig> customEngines,
     required bool followAlong,
     required String splitMode,
+    required int mergeMinChars,
     required double fontSize,
+    required double lineHeight,
+    required double horizontalPadding,
+    required String themeId,
+    required bool ignoreBadCert,
     required String logLevel,
     required String lastBackupDir,
     required Future<void> Function() onExportBackup,
@@ -928,9 +1256,14 @@ class ReaderDialogs {
       required int maxCacheCount,
       required Map<String, String> engineNetworkModes,
       required Map<String, String> engineCustomProxies,
+      required bool ignoreBadCert,
       required bool followAlong,
       required String splitMode,
+      required int mergeMinChars,
       required double fontSize,
+      required double lineHeight,
+      required double horizontalPadding,
+      required String themeId,
       required String logLevel,
     }) onSave,
   }) {
@@ -952,7 +1285,12 @@ class ReaderDialogs {
           customEngines: customEngines,
           followAlong: followAlong,
           splitMode: splitMode,
+          mergeMinChars: mergeMinChars,
           fontSize: fontSize,
+          lineHeight: lineHeight,
+          horizontalPadding: horizontalPadding,
+          themeId: themeId,
+          ignoreBadCert: ignoreBadCert,
           logLevel: logLevel,
           lastBackupDir: lastBackupDir,
           onExportBackup: onExportBackup,
@@ -965,7 +1303,7 @@ class ReaderDialogs {
     );
   }
 
-  // 2. 自定义 TTS 引擎管理中心 (支持 3 态网络类型：直连 / 系统代理 / 自定义端口)
+  // 2. 自定义 TTS 引擎管理中心
   static Future<void> showCustomEnginesDialog({
     required BuildContext context,
     required List<CustomTtsEngineConfig> customEngines,
@@ -1001,6 +1339,7 @@ class ReaderDialogs {
       final headersCtrl = TextEditingController(text: const JsonEncoder.withIndent('  ').convert(draft.headers));
       final bodyCtrl = TextEditingController(text: draft.bodyTemplate);
       final jsonPathCtrl = TextEditingController(text: draft.jsonPath);
+      final testTextCtrl = TextEditingController(text: draft.testText);
       final voicesCtrl = TextEditingController(
         text: draft.voices.entries.map((e) => '${e.key}=${e.value}').join('\n'),
       );
@@ -1010,6 +1349,7 @@ class ReaderDialogs {
       String method = draft.method;
       String responseType = draft.responseType;
       String networkMode = normalizeEngineNetworkMode(draft.networkMode);
+      bool ignoreBadCert = draft.ignoreBadCert;
       int editorMode = 0;
       String testResultMsg = "";
       bool isTesting = false;
@@ -1053,6 +1393,8 @@ class ReaderDialogs {
           voices: parsedVoices,
           networkMode: networkMode,
           customProxy: normalizeProxyInput(customProxyCtrl.text),
+          ignoreBadCert: ignoreBadCert,
+          testText: testTextCtrl.text.trim(),
         );
       }
 
@@ -1065,10 +1407,12 @@ class ReaderDialogs {
         headersCtrl.text = const JsonEncoder.withIndent('  ').convert(cfg.headers);
         bodyCtrl.text = cfg.bodyTemplate;
         jsonPathCtrl.text = cfg.jsonPath;
+        testTextCtrl.text = cfg.testText;
         voicesCtrl.text = cfg.voices.entries.map((e) => '${e.key}=${e.value}').join('\n');
         method = cfg.method;
         responseType = cfg.responseType;
         networkMode = normalizeEngineNetworkMode(cfg.networkMode);
+        ignoreBadCert = cfg.ignoreBadCert;
         rawCodeCtrl.text = cfg.toPrettyCode();
       }
 
@@ -1185,12 +1529,11 @@ class ReaderDialogs {
                         padding: const EdgeInsets.all(8),
                         decoration: BoxDecoration(color: const Color(0xFFEFE7D2), borderRadius: BorderRadius.circular(6)),
                         child: const Text(
-                          "可用模板变量：{{text_json}} (JSON安全正文)、{{text_url}} (URL编码)、{{text}}、{{voice}}、{{speed}}、{{rate_percent}}、{{bitrate}}、{{api_key}}",
+                          "可用模板变量：{{text_json}} (JSON安全)、{{text_xml}} (XML安全)、{{text_url}} (URL编码)、{{text}}、{{voice}}、{{speed}}、{{rate_percent}}、{{bitrate}}、{{api_key}}",
                           style: TextStyle(fontSize: 10.5, color: Color(0xFF743C00)),
                         ),
                       ),
                       const SizedBox(height: 10),
-
                       if (editorMode == 0) ...[
                         TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: "引擎名称", isDense: true)),
                         const SizedBox(height: 10),
@@ -1220,7 +1563,14 @@ class ReaderDialogs {
                             ),
                           ),
                         ],
-                        const SizedBox(height: 8),
+                        SwitchListTile(
+                          contentPadding: EdgeInsets.zero,
+                          dense: true,
+                          title: const Text("忽略此引擎的自签名 HTTPS 证书", style: TextStyle(fontSize: 12.5)),
+                          value: ignoreBadCert,
+                          onChanged: (v) => setEditState(() => ignoreBadCert = v),
+                        ),
+                        const SizedBox(height: 4),
                         Row(
                           children: [
                             SizedBox(
@@ -1293,6 +1643,15 @@ class ReaderDialogs {
                             border: OutlineInputBorder(),
                           ),
                         ),
+                        const SizedBox(height: 8),
+                        TextField(
+                          controller: testTextCtrl,
+                          decoration: const InputDecoration(
+                            labelText: "自定义测试文本 (可选，留空默认中文测试句)",
+                            hintText: "如 Hello, this is a test.",
+                            isDense: true,
+                          ),
+                        ),
                       ] else ...[
                         TextField(
                           controller: rawCodeCtrl,
@@ -1304,7 +1663,6 @@ class ReaderDialogs {
                           ),
                         ),
                       ],
-
                       if (testResultMsg.isNotEmpty)
                         Padding(
                           padding: const EdgeInsets.only(top: 8),
@@ -1344,8 +1702,7 @@ class ReaderDialogs {
                             isTesting = true;
                             testResultMsg = "正在发起测试请求 (${candidate!.networkMode})...";
                           });
-                          final client = networkRouter.getClientForEngine(candidate.id, [candidate]);
-                          final res = await CustomTtsRunner.testConnectivity(candidate, client);
+                          final res = await CustomTtsRunner.testConnectivity(candidate, networkRouter);
                           if (!disposed) {
                             setEditState(() {
                               isTesting = false;
@@ -1402,6 +1759,7 @@ class ReaderDialogs {
         headersCtrl.dispose();
         bodyCtrl.dispose();
         jsonPathCtrl.dispose();
+        testTextCtrl.dispose();
         voicesCtrl.dispose();
         rawCodeCtrl.dispose();
         curlCtrl.dispose();
@@ -1523,8 +1881,8 @@ class ReaderDialogs {
     );
   }
 
-  // 3. 发音人管理与试听中心
-  static void showVoiceManagerDialog({
+  // 3. 发音人管理与试听中心 (支持取消在途试听 + 顶层提示)
+  static Future<void> showVoiceManagerDialog({
     required BuildContext context,
     required String currentEngine,
     required String selectedVoiceId,
@@ -1548,6 +1906,7 @@ class ReaderDialogs {
     String activeVoiceId = selectedVoiceId;
     bool isDisposed = false;
     int previewSeq = 0;
+    TtsCancelToken? activePreviewToken;
 
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
@@ -1563,7 +1922,7 @@ class ReaderDialogs {
       return userMsVoices;
     }
 
-    showDialog(
+    return showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDlgState) {
@@ -1802,6 +2161,9 @@ class ReaderDialogs {
                                 icon: const Icon(Icons.play_circle_fill, color: Color(0xFFC87D2E), size: 26),
                                 tooltip: "试听效果",
                                 onPressed: () async {
+                                  activePreviewToken?.cancel();
+                                  final token = TtsCancelToken();
+                                  activePreviewToken = token;
                                   final mySeq = ++previewSeq;
                                   try {
                                     const sample = "您好，欢迎使用听书阅读器，这是当前发音人的试听效果。";
@@ -1815,6 +2177,7 @@ class ReaderDialogs {
                                       fishTts: fishTts,
                                       customEngines: customEngines,
                                       networkRouter: networkRouter,
+                                      cancelToken: token,
                                     );
                                     if (isDisposed || mySeq != previewSeq) return;
                                     try {
@@ -1829,9 +2192,11 @@ class ReaderDialogs {
                                       await previewPlayer.setFilePath(bufferFile.path);
                                       await previewPlayer.play();
                                     }
+                                  } on TtsCancelledException {
+                                    return;
                                   } catch (err) {
-                                    if (!isDisposed && context.mounted) {
-                                      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("试听失败: $err")));
+                                    if (!isDisposed) {
+                                      AppToast.show("试听失败: $err", isError: true);
                                     }
                                   }
                                 },
@@ -1857,11 +2222,11 @@ class ReaderDialogs {
                                       break;
                                     case 'copy_id':
                                       Clipboard.setData(ClipboardData(text: e.key));
-                                      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("发音人 ID 已复制")));
+                                      AppToast.show("发音人 ID 已复制");
                                       break;
                                     case 'delete':
                                       if (activeMap.length <= 1) {
-                                        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("必须保留至少一个发音人")));
+                                        AppToast.show("必须保留至少一个发音人", isError: true);
                                         return;
                                       }
                                       showDialog(
@@ -1950,6 +2315,7 @@ class ReaderDialogs {
       ),
     ).then((_) {
       isDisposed = true;
+      activePreviewToken?.cancel();
       previewPlayer.dispose();
     });
   }
@@ -2042,7 +2408,7 @@ class ReaderDialogs {
     );
   }
 
-  // 5. 运行日志管理界面 (支持 3 层级 error / info / all 与分级着色)
+  // 5. 运行日志管理界面
   static void showLogViewerDialog({
     required BuildContext context,
     required Function(String newLevel) onLogLevelChanged,
@@ -2128,7 +2494,7 @@ class ReaderDialogs {
                             label: const Text("复制", style: TextStyle(fontSize: 11)),
                             onPressed: () {
                               Clipboard.setData(ClipboardData(text: logLines.join('\n')));
-                              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("日志已复制到剪贴板")));
+                              AppToast.show("日志已复制到剪贴板");
                             },
                           ),
                           FilledButton.tonalIcon(
@@ -2156,7 +2522,7 @@ class ReaderDialogs {
                                         logLines = [];
                                         logSizeBytes = 0;
                                         setDlg(() {});
-                                        if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("日志已彻底清空")));
+                                        AppToast.show("日志已彻底清空");
                                       },
                                       child: const Text("确认清空"),
                                     ),
@@ -2216,7 +2582,7 @@ class ReaderDialogs {
     );
   }
 
-  // 6. 备份文件历史恢复选择器 (多行完整展示长文件名，宽屏不截断)
+  // 6. 备份文件历史恢复选择器
   static Future<bool> showRestorePicker({
     required BuildContext context,
     required String lastBackupDir,
@@ -2368,7 +2734,7 @@ class ReaderDialogs {
     }
   }
 
-  // 7. 批量合并 MP3 导出弹窗
+  // 7. 批量合并 MP3 导出弹窗 (含失败切片一键补录)
   static void openExportDialog({
     required BuildContext hostContext,
     required ExportController exportController,
@@ -2391,7 +2757,10 @@ class ReaderDialogs {
     required Function(String newDir) onSaveMp3Dir,
     required Function(int newThreads) onSaveThreads,
   }) {
-    if (nodes.isEmpty) return;
+    if (nodes.isEmpty) {
+      AppToast.show("请先打开一本电子书", isError: true);
+      return;
+    }
 
     int exportMode = alignedChapters.isEmpty ? 1 : 0;
     int selectedChapterIdx = 0;
@@ -2451,6 +2820,47 @@ class ReaderDialogs {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       if (!exportController.isExporting) ...[
+                        if (exportController.hasRetryableFailures) ...[
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(10),
+                            margin: const EdgeInsets.only(bottom: 14),
+                            decoration: BoxDecoration(
+                              color: Colors.orange.shade50,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: Colors.orange.shade300),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  "⚠️ 上次导出有 ${exportController.retryableFailureCount} 个切片失败，已保留已成功片段",
+                                  style: TextStyle(fontSize: 12.5, fontWeight: FontWeight.bold, color: Colors.orange.shade900),
+                                ),
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 8,
+                                  children: [
+                                    FilledButton.icon(
+                                      style: FilledButton.styleFrom(visualDensity: VisualDensity.compact),
+                                      icon: const Icon(Icons.replay, size: 15),
+                                      label: const Text("仅重试失败片段并重合并", style: TextStyle(fontSize: 12)),
+                                      onPressed: () {
+                                        Navigator.pop(dlgCtx);
+                                        exportController.retryFailedChunks();
+                                      },
+                                    ),
+                                    TextButton(
+                                      style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
+                                      onPressed: exportController.clearRetryCache,
+                                      child: const Text("放弃残留缓存", style: TextStyle(fontSize: 12)),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
                         SegmentedButton<int>(
                           segments: const [
                             ButtonSegment(value: 0, label: Text("按章节导出"), icon: Icon(Icons.bookmark_outline)),
@@ -2646,7 +3056,6 @@ class ReaderDialogs {
                       Navigator.pop(dlgCtx);
 
                       exportController.startBackgroundExport(
-                        hostContext: hostContext,
                         nodes: nodes,
                         sIdx: s,
                         eIdx: e,
