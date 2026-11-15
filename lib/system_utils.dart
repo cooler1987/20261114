@@ -25,7 +25,7 @@ class _StorageEntry {
   });
 }
 
-// ────────────────── A 存储权限与专业物理路径文件管理器 ──────────────────
+// ────────────────── A 存储权限与专业物理路径文件管理器 (完整文件名防截断) ──────────────────
 class StorageHelper {
   static Future<bool> checkAndRequestManagePermission() async {
     if (!Platform.isAndroid) return true;
@@ -68,20 +68,21 @@ class StorageHelper {
 
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
-    final dialogWidth = min(580.0, screenWidth * 0.94);
-    final dialogHeight = min(660.0, screenHeight * 0.85);
+    final dialogWidth = min(660.0, screenWidth - 20);
+    final dialogHeight = min(680.0, screenHeight * 0.85);
 
     return showDialog<String>(
       context: context,
       builder: (dialogContext) => StatefulBuilder(
         builder: (ctx, setDialogState) => AlertDialog(
+          insetPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 16),
           titlePadding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
           contentPadding: const EdgeInsets.symmetric(horizontal: 10),
           title: Row(
             children: [
               Icon(chooseDirectory ? Icons.folder : Icons.folder_special, color: const Color(0xFFC87D2E), size: 22),
               const SizedBox(width: 8),
-              Text(chooseDirectory ? '选择目录' : '选择电子书文件', style: const TextStyle(fontSize: 16)),
+              Text(chooseDirectory ? '选择目录' : '选择文件', style: const TextStyle(fontSize: 16)),
             ],
           ),
           content: SizedBox(
@@ -150,17 +151,16 @@ class StorageHelper {
                                 final item = entries[index];
                                 return ListTile(
                                   dense: true,
-                                  contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
                                   leading: Icon(
                                     item.isDir ? Icons.folder : Icons.insert_drive_file,
                                     color: item.isDir ? Colors.amber[700] : const Color(0xFFC87D2E),
-                                    size: 28,
+                                    size: 26,
                                   ),
                                   title: Text(
                                     item.name,
-                                    maxLines: 4,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(fontSize: 13, height: 1.3, fontWeight: FontWeight.w500),
+                                    softWrap: true,
+                                    style: const TextStyle(fontSize: 13, height: 1.35, fontWeight: FontWeight.w500),
                                   ),
                                   subtitle: Padding(
                                     padding: const EdgeInsets.only(top: 4),
@@ -182,7 +182,9 @@ class StorageHelper {
                                           ),
                                         ),
                                         const SizedBox(width: 8),
-                                        Text(item.metaText, style: const TextStyle(fontSize: 10.5, color: Colors.blueGrey)),
+                                        Flexible(
+                                          child: Text(item.metaText, style: const TextStyle(fontSize: 10.5, color: Colors.blueGrey)),
+                                        ),
                                       ],
                                     ),
                                   ),
@@ -249,7 +251,7 @@ class StorageHelper {
         try {
           final stat = await entity.stat();
           final sizeStr = formatFileSize(stat.size);
-          final dateStr = "${stat.modified.year}-${stat.modified.month.toString().padLeft(2, '0')}-${stat.modified.day.toString().padLeft(2, '0')}";
+          final dateStr = "${stat.modified.year}-${stat.modified.month.toString().padLeft(2, '0')}-${stat.modified.day.toString().padLeft(2, '0')} ${stat.modified.hour.toString().padLeft(2, '0')}:${stat.modified.minute.toString().padLeft(2, '0')}";
           metaText = "$sizeStr · $dateStr";
         } catch (_) {
           metaText = "文件";
@@ -261,19 +263,23 @@ class StorageHelper {
   }
 }
 
-// ────────────────── 真分级高可用日志系统 (支持自动大小轮转) ──────────────────
+// ────────────────── 真分级高可用日志系统 (支持 3 层级: error / info / all) ──────────────────
 class AppLogger {
-  static IOSink? _sink;
   static File? _logFile;
-  static String logLevel = "error";
-  static const int _maxLogBytes = 2 * 1024 * 1024; // 2MB 上限
+  static String logLevel = "error"; // 'error' | 'info' | 'all'
+  static const int _maxLogBytes = 2 * 1024 * 1024;
+
+  static String normalizeLevel(String? raw) {
+    if (raw == 'all') return 'all';
+    if (raw == 'info') return 'info';
+    return 'error';
+  }
 
   static Future<void> init() async {
     try {
       final dir = await getApplicationDocumentsDirectory();
       _logFile = File('${dir.path}${Platform.pathSeparator}app_debug.log');
       await _rotateIfNeeded();
-      _sink = _logFile!.openWrite(mode: FileMode.append);
     } catch (_) {}
   }
 
@@ -290,29 +296,28 @@ class AppLogger {
 
   static void log(String message, [dynamic error, StackTrace? stack, bool isImportant = false]) {
     final bool isErr = error != null;
-    if (logLevel == "error" && !isErr && !isImportant) {
-      return;
-    }
+    if (logLevel == "error" && !isErr) return;
+    if (logLevel == "info" && !isErr && !isImportant) return;
 
     final now = DateTime.now().toIso8601String().substring(11, 23);
-    final tag = isErr ? '[ERROR]' : '[INFO] ';
+    final tag = isErr ? '[ERROR]' : (isImportant ? '[EVENT]' : '[DEBUG]');
     final line = "[$now] $tag $message${isErr ? ' | 异常: $error' : ''}";
     debugPrint(line);
     try {
-      _sink?.writeln(line);
+      final sb = StringBuffer()..writeln(line);
       if (stack != null) {
-        _sink?.writeln("堆栈追踪:\n$stack");
+        sb.writeln("堆栈追踪:\n$stack");
       }
+      _logFile?.writeAsStringSync(sb.toString(), mode: FileMode.append, flush: isErr || isImportant);
     } catch (_) {}
   }
 
   static Future<List<String>> readLogLines({int maxLines = 800}) async {
     try {
-      await _sink?.flush();
       if (_logFile != null && await _logFile!.exists()) {
         final content = await _logFile!.readAsString();
         if (content.isEmpty) return [];
-        final lines = content.split('\n');
+        final lines = content.split('\n').where((l) => l.isNotEmpty).toList();
         if (lines.length > maxLines) {
           return lines.sublist(lines.length - maxLines);
         }
@@ -324,7 +329,6 @@ class AppLogger {
 
   static Future<int> getLogSizeBytes() async {
     try {
-      await _sink?.flush();
       if (_logFile != null && await _logFile!.exists()) return await _logFile!.length();
     } catch (_) {}
     return 0;
@@ -332,28 +336,33 @@ class AppLogger {
 
   static Future<void> clearLogs() async {
     try {
-      await _sink?.flush();
-      await _sink?.close();
-      _sink = null;
       if (_logFile != null && await _logFile!.exists()) {
         await _logFile!.writeAsString("", flush: true);
-      }
-      if (_logFile != null) {
-        _sink = _logFile!.openWrite(mode: FileMode.append);
       }
     } catch (_) {}
   }
 }
 
-// ────────────────── 系统代理探测 (含 Windows 注册表与环境变量) ──────────────────
+// ────────────────── 代理规范化与系统代理探测 ──────────────────
+String normalizeProxyInput(String raw) {
+  var cleaned = raw.trim().replaceAll(RegExp(r'^https?://', caseSensitive: false), '').replaceAll(RegExp(r'/$'), '');
+  if (cleaned.isEmpty) return '';
+  // 若用户仅输入端口号如 "7890"，自动补全为本机回环地址
+  if (RegExp(r'^\d{1,5}$').hasMatch(cleaned)) {
+    return '127.0.0.1:$cleaned';
+  }
+  return cleaned;
+}
+
 Future<String?> detectSystemProxy() async {
-  // 1. 优先读环境变量
+  // 1. 环境变量
   final envProxy = Platform.environment['https_proxy'] ??
       Platform.environment['HTTPS_PROXY'] ??
       Platform.environment['http_proxy'] ??
       Platform.environment['HTTP_PROXY'];
   if (envProxy != null && envProxy.trim().isNotEmpty) {
-    return envProxy.trim().replaceAll(RegExp(r'^https?://'), '').replaceAll(RegExp(r'/$'), '');
+    final norm = normalizeProxyInput(envProxy);
+    if (norm.isNotEmpty) return norm;
   }
 
   // 2. Windows 读取 Internet Settings 注册表
@@ -377,8 +386,23 @@ Future<String?> detectSystemProxy() async {
               final pick = parts.firstWhere((p) => p.startsWith('https='), orElse: () => parts.first);
               raw = pick.split('=').last.trim();
             }
-            if (raw.isNotEmpty) return raw.replaceAll(RegExp(r'^https?://'), '');
+            final norm = normalizeProxyInput(raw);
+            if (norm.isNotEmpty) return norm;
           }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 3. Android 尝试读取系统属性代理
+  if (Platform.isAndroid) {
+    try {
+      final res = await Process.run('settings', ['get', 'global', 'http_proxy']);
+      if (res.exitCode == 0) {
+        final out = res.stdout.toString().trim();
+        if (out.isNotEmpty && out != 'null' && out != ':0') {
+          final norm = normalizeProxyInput(out);
+          if (norm.isNotEmpty) return norm;
         }
       }
     } catch (_) {}
