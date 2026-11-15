@@ -116,7 +116,7 @@ class ReaderController extends ChangeNotifier {
   int get activeParagraphIndex {
     if (paragraphs.isEmpty || nodes.isEmpty) return 0;
     final idx = currentIndex.clamp(0, nodes.length - 1);
-    return BookParser.findParagraphIndexByCharOffset(paragraphs, nodes[idx].startOffset);
+    return BookParser.findParagraphByCharOffset(paragraphs, nodes[idx].startOffset);
   }
 
   TextSliceNode? get activeSliceNode {
