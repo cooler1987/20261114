@@ -4,25 +4,80 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 
 import 'models.dart';
 import 'system_utils.dart';
 
-// ────────────────── 分引擎连接池与 3 态网络路由器 (直连 / 系统代理 / 自定义代理端口) ──────────────────
+// ────────────────── 请求级取消令牌 (切句/停止时立即 Abort 底层 Socket) ──────────────────
+class TtsCancelledException implements Exception {
+  @override
+  String toString() => '请求已取消';
+}
+
+class TtsCancelToken {
+  bool _cancelled = false;
+  final List<VoidCallback> _abortHooks = [];
+
+  bool get isCancelled => _cancelled;
+
+  void registerAbort(VoidCallback hook) {
+    if (_cancelled) {
+      try {
+        hook();
+      } catch (_) {}
+      return;
+    }
+    _abortHooks.add(hook);
+  }
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    for (final hook in List<VoidCallback>.from(_abortHooks)) {
+      try {
+        hook();
+      } catch (_) {}
+    }
+    _abortHooks.clear();
+  }
+}
+
+// ────────────────── 分引擎连接池与 3 态网络路由器 ──────────────────
 class TtsNetworkRouter {
   String? detectedSystemProxy;
   Map<String, String> engineNetworkModes = {'ms': 'direct', 'fish': 'direct'};
   Map<String, String> engineCustomProxies = {};
+  bool ignoreBadCertificate = false;
 
-  IOClient? _directClient;
-  final Map<String, IOClient> _proxyClients = {};
+  HttpClient? _directRawClient;
+  IOClient? _directIoClient;
+  final Map<String, HttpClient> _proxyRawClients = {};
+  final Map<String, IOClient> _proxyIoClients = {};
 
   Future<String?> refreshSystemProxy() async {
     detectedSystemProxy = await detectSystemProxy();
     AppLogger.log("系统代理探测完成: ${detectedSystemProxy ?? '未检测到系统代理'}", null, null, true);
     return detectedSystemProxy;
+  }
+
+  void setIgnoreBadCert(bool value) {
+    if (ignoreBadCertificate == value) return;
+    ignoreBadCertificate = value;
+    _rebuildProxyClients();
+  }
+
+  void _rebuildProxyClients() {
+    for (final c in _proxyIoClients.values) {
+      c.close();
+    }
+    _proxyIoClients.clear();
+    for (final c in _proxyRawClients.values) {
+      c.close(force: true);
+    }
+    _proxyRawClients.clear();
   }
 
   String getEngineRoute(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
@@ -53,50 +108,174 @@ class TtsNetworkRouter {
     }
   }
 
-  IOClient _getOrCreateProxyClient(String addr) {
-    return _proxyClients.putIfAbsent(addr, () {
+  HttpClient _getRawProxyClient(String addr, {bool? forceIgnoreCert}) {
+    final allowBad = forceIgnoreCert ?? ignoreBadCertificate;
+    final key = '$addr|$allowBad';
+    return _proxyRawClients.putIfAbsent(key, () {
       final raw = HttpClient();
       raw.findProxy = (_) => "PROXY $addr; DIRECT";
       raw.connectionTimeout = const Duration(seconds: 15);
       raw.idleTimeout = const Duration(seconds: 30);
-      raw.badCertificateCallback = (_, __, ___) => true;
-      return IOClient(raw);
+      if (allowBad) {
+        raw.badCertificateCallback = (_, __, ___) => true;
+      }
+      return raw;
     });
   }
 
-  http.Client getClientForEngine(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
+  HttpClient _getRawDirectClient({bool forceIgnoreCert = false}) {
+    if (forceIgnoreCert) {
+      return _proxyRawClients.putIfAbsent('DIRECT|true', () {
+        final raw = HttpClient()
+          ..findProxy = ((_) => "DIRECT")
+          ..connectionTimeout = const Duration(seconds: 15)
+          ..idleTimeout = const Duration(seconds: 30)
+          ..badCertificateCallback = (_, __, ___) => true;
+        return raw;
+      });
+    }
+    _directRawClient ??= HttpClient()
+      ..findProxy = ((_) => "DIRECT")
+      ..connectionTimeout = const Duration(seconds: 15)
+      ..idleTimeout = const Duration(seconds: 30);
+    return _directRawClient!;
+  }
+
+  HttpClient getRawClientForEngine(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
+    bool? engineIgnoreCert;
+    if (customEngines != null) {
+      for (final c in customEngines) {
+        if (c.id == engineId) {
+          engineIgnoreCert = c.ignoreBadCert;
+          break;
+        }
+      }
+    }
+
     final route = getEngineRoute(engineId, customEngines);
     if (route == 'system') {
       if (detectedSystemProxy != null && detectedSystemProxy!.isNotEmpty) {
-        return _getOrCreateProxyClient(detectedSystemProxy!);
+        return _getRawProxyClient(detectedSystemProxy!, forceIgnoreCert: engineIgnoreCert);
       }
     } else if (route == 'custom') {
       final customAddr = getEngineCustomProxy(engineId, customEngines);
       if (customAddr.isNotEmpty) {
-        return _getOrCreateProxyClient(customAddr);
+        return _getRawProxyClient(customAddr, forceIgnoreCert: engineIgnoreCert);
+      }
+    }
+    return _getRawDirectClient(forceIgnoreCert: engineIgnoreCert ?? false);
+  }
+
+  http.Client getClientForEngine(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
+    final raw = getRawClientForEngine(engineId, customEngines);
+    if (identical(raw, _directRawClient)) {
+      _directIoClient ??= IOClient(raw);
+      return _directIoClient!;
+    }
+    final key = raw.hashCode.toString();
+    return _proxyIoClients.putIfAbsent(key, () => IOClient(raw));
+  }
+
+  /// 支持即时中断底层连接的请求发送器
+  Future<http.Response> sendRequest({
+    required HttpClient rawClient,
+    required String method,
+    required Uri uri,
+    Map<String, String>? headers,
+    List<int>? bodyBytes,
+    required Duration timeout,
+    TtsCancelToken? cancelToken,
+  }) async {
+    if (cancelToken?.isCancelled == true) throw TtsCancelledException();
+
+    HttpClientRequest? req;
+    StreamSubscription<List<int>>? bodySub;
+    bool aborted = false;
+
+    final completer = Completer<http.Response>();
+
+    void doAbort() {
+      if (aborted) return;
+      aborted = true;
+      try {
+        req?.abort();
+      } catch (_) {}
+      try {
+        bodySub?.cancel();
+      } catch (_) {}
+      if (!completer.isCompleted) {
+        completer.completeError(TtsCancelledException());
       }
     }
 
-    _directClient ??= IOClient(
-      HttpClient()
-        ..findProxy = ((_) => "DIRECT")
-        ..connectionTimeout = const Duration(seconds: 15)
-        ..idleTimeout = const Duration(seconds: 30),
-    );
-    return _directClient!;
+    cancelToken?.registerAbort(doAbort);
+
+    () async {
+      try {
+        req = await rawClient.openUrl(method, uri).timeout(timeout);
+        if (aborted || cancelToken?.isCancelled == true) {
+          doAbort();
+          return;
+        }
+        headers?.forEach((k, v) => req!.headers.set(k, v));
+        if (bodyBytes != null && bodyBytes.isNotEmpty) {
+          req!.contentLength = bodyBytes.length;
+          req!.add(bodyBytes);
+        }
+        final res = await req!.close().timeout(timeout);
+        if (aborted || cancelToken?.isCancelled == true) {
+          doAbort();
+          return;
+        }
+
+        final builder = BytesBuilder(copy: false);
+        bodySub = res.listen(
+          (chunk) {
+            if (aborted || cancelToken?.isCancelled == true) {
+              doAbort();
+              return;
+            }
+            builder.add(chunk);
+          },
+          onDone: () {
+            if (!completer.isCompleted) {
+              final resHeaders = <String, String>{};
+              res.headers.forEach((name, values) {
+                resHeaders[name] = values.join(', ');
+              });
+              completer.complete(http.Response.bytes(builder.takeBytes(), res.statusCode, headers: resHeaders));
+            }
+          },
+          onError: (e, st) {
+            if (!completer.isCompleted) {
+              completer.completeError(aborted ? TtsCancelledException() : e, st);
+            }
+          },
+          cancelOnError: true,
+        );
+      } catch (e, st) {
+        if (!completer.isCompleted) {
+          completer.completeError(aborted ? TtsCancelledException() : e, st);
+        }
+      }
+    }();
+
+    return completer.future.timeout(timeout, onTimeout: () {
+      doAbort();
+      throw TimeoutException('请求超时 (${timeout.inSeconds}s)');
+    });
   }
 
   void dispose() {
-    _directClient?.close();
-    _directClient = null;
-    for (final c in _proxyClients.values) {
-      c.close();
-    }
-    _proxyClients.clear();
+    _directIoClient?.close();
+    _directIoClient = null;
+    _directRawClient?.close(force: true);
+    _directRawClient = null;
+    _rebuildProxyClients();
   }
 }
 
-// ────────────────── TTS 微软官方引擎 (带并发锁与 401 重试) ──────────────────
+// ────────────────── TTS 微软官方引擎 (XML清洗 + 动态Lang + 429退避) ──────────────────
 class MicrosoftTranslatorTTS {
   static const authUrl = 'https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0';
   static const clientConstant = 'oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==';
@@ -109,6 +288,22 @@ class MicrosoftTranslatorTTS {
     _token = null;
     _region = null;
     _expires = 0;
+  }
+
+  static String sanitizeXmlText(String text) {
+    // 剔除 TXT 电子书常见的非法 XML 控制字符，避免微软接口返回 HTTP 400
+    final cleaned = text.replaceAll(RegExp(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]'), '');
+    return cleaned
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&apos;');
+  }
+
+  static String extractXmlLang(String voice) {
+    final m = RegExp(r'^([a-zA-Z]{2,3}-[A-Za-z0-9]{2,4})').firstMatch(voice.trim());
+    return m != null ? m.group(1)! : 'zh-CN';
   }
 
   static String _stamp(DateTime value) {
@@ -182,42 +377,51 @@ class MicrosoftTranslatorTTS {
   static Future<Uint8List> synthesize(
     String text,
     String voice, {
-    required http.Client client,
+    required TtsNetworkRouter router,
     double speed = 1,
     int bitrate = 64,
     int timeoutSeconds = 60,
+    TtsCancelToken? cancelToken,
   }) async {
     final watch = Stopwatch()..start();
     final rateValue = ((speed - 1) * 100).round();
     final rate = rateValue >= 0 ? '+$rateValue%' : '$rateValue%';
-    final escaped = text
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&apos;');
+    final escaped = sanitizeXmlText(text);
+    final xmlLang = extractXmlLang(voice);
     final ssml =
-        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="zh-CN"><voice name="$voice"><prosody rate="$rate" pitch="+0%" volume="+0%">$escaped</prosody></voice></speak>';
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="$xmlLang"><voice name="$voice"><prosody rate="$rate" pitch="+0%" volume="+0%">$escaped</prosody></voice></speak>';
     final format = bitrate == 128 ? 'audio-16khz-128kbitrate-mono-mp3' : 'audio-16khz-64kbitrate-mono-mp3';
 
-    for (int attempt = 0; attempt < 2; attempt++) {
-      final endpoint = await getEndpoint(client);
+    final ioClient = router.getClientForEngine('ms');
+    final rawClient = router.getRawClientForEngine('ms');
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+      if (cancelToken?.isCancelled == true) throw TtsCancelledException();
+      final endpoint = await getEndpoint(ioClient);
       final url = Uri.parse('https://${endpoint['region']}.tts.speech.microsoft.com/cognitiveservices/v1');
-      final res = await client
-          .post(
-            url,
-            headers: {
-              'Authorization': endpoint['token']!,
-              'X-Microsoft-OutputFormat': format,
-              'User-Agent': 'okhttp/4.5.0',
-              'Content-Type': 'application/ssml+xml',
-            },
-            body: utf8.encode(ssml),
-          )
-          .timeout(Duration(seconds: timeoutSeconds));
+      final res = await router.sendRequest(
+        rawClient: rawClient,
+        method: 'POST',
+        uri: url,
+        headers: {
+          'Authorization': endpoint['token']!,
+          'X-Microsoft-OutputFormat': format,
+          'User-Agent': 'okhttp/4.5.0',
+          'Content-Type': 'application/ssml+xml',
+        },
+        bodyBytes: utf8.encode(ssml),
+        timeout: Duration(seconds: timeoutSeconds),
+        cancelToken: cancelToken,
+      );
 
       if ((res.statusCode == 401 || res.statusCode == 403) && attempt == 0) {
         invalidateToken();
+        continue;
+      }
+      if (res.statusCode == 429 && attempt < 2) {
+        final retryAfterSec = int.tryParse(res.headers['retry-after'] ?? '') ?? (attempt + 1) * 2;
+        AppLogger.log("微软触发 429 限流，退避 ${retryAfterSec}s 后重试...", null, null, true);
+        await Future.delayed(Duration(seconds: retryAfterSec.clamp(1, 10)));
         continue;
       }
       if (res.statusCode != 200) {
@@ -228,7 +432,7 @@ class MicrosoftTranslatorTTS {
       AppLogger.log("微软合成完成 [耗时: ${watch.elapsedMilliseconds}ms, 大小: ${formatFileSize(res.bodyBytes.length)}]");
       return res.bodyBytes;
     }
-    throw Exception('微软认证连续失效');
+    throw Exception('微软认证或限流重试耗尽');
   }
 
   static Future<Map<String, dynamic>> testConnectivity(http.Client client) async {
@@ -300,23 +504,28 @@ class FishAudioTTS {
   Future<Uint8List> textToSpeech(
     String text,
     String voice, {
-    required http.Client client,
+    required TtsNetworkRouter router,
     double speed = 1,
     int bitrate = 64,
     int timeoutSeconds = 60,
+    TtsCancelToken? cancelToken,
   }) async {
     if (apiKey.isEmpty) throw Exception('请先配置 Fish Audio API Key');
     final watch = Stopwatch()..start();
     final ref = voices.containsKey(voice) ? voice : (voice.isNotEmpty ? voice : voices.keys.first);
     final body = <String, dynamic>{'text': text, 'format': 'mp3', 'reference_id': ref, 'normalize': true, 'mp3_bitrate': bitrate};
     if ((speed - 1).abs() >= 0.05) body['prosody'] = {'speed': double.parse(speed.toStringAsFixed(2))};
-    final response = await client
-        .post(
-          Uri.parse('https://api.fish.audio/v1/tts'),
-          headers: {'Authorization': 'Bearer $apiKey', 'Content-Type': 'application/json', 'model': model},
-          body: jsonEncode(body),
-        )
-        .timeout(Duration(seconds: timeoutSeconds));
+
+    final rawClient = router.getRawClientForEngine('fish');
+    final response = await router.sendRequest(
+      rawClient: rawClient,
+      method: 'POST',
+      uri: Uri.parse('https://api.fish.audio/v1/tts'),
+      headers: {'Authorization': 'Bearer $apiKey', 'Content-Type': 'application/json', 'model': model},
+      bodyBytes: utf8.encode(jsonEncode(body)),
+      timeout: Duration(seconds: timeoutSeconds),
+      cancelToken: cancelToken,
+    );
     watch.stop();
 
     if (response.statusCode != 200) {
@@ -365,10 +574,11 @@ class CustomTtsRunner {
     CustomTtsEngineConfig cfg,
     String text,
     String voice, {
-    required http.Client client,
+    required TtsNetworkRouter router,
     double speed = 1.0,
     int bitrate = 64,
     int timeoutSeconds = 60,
+    TtsCancelToken? cancelToken,
   }) async {
     if (cfg.url.trim().isEmpty) throw Exception('自定义引擎 [${cfg.name}] 未配置请求 URL');
     final watch = Stopwatch()..start();
@@ -381,6 +591,7 @@ class CustomTtsRunner {
     final vars = <String, String>{
       'text': text,
       'text_json': jsonInnerText,
+      'text_xml': MicrosoftTranslatorTTS.sanitizeXmlText(text),
       'text_url': Uri.encodeQueryComponent(text),
       'voice': voice,
       'speed': speed.toStringAsFixed(2),
@@ -398,15 +609,19 @@ class CustomTtsRunner {
       resolvedHeaders[k] = renderTemplate(v, vars);
     });
 
-    final http.Response res;
-    if (cfg.method.toUpperCase() == 'GET') {
-      res = await client.get(uri, headers: resolvedHeaders).timeout(Duration(seconds: timeoutSeconds));
-    } else {
-      final resolvedBody = renderTemplate(cfg.bodyTemplate, vars);
-      res = await client
-          .post(uri, headers: resolvedHeaders, body: utf8.encode(resolvedBody))
-          .timeout(Duration(seconds: timeoutSeconds));
-    }
+    final rawClient = router.getRawClientForEngine(cfg.id, [cfg]);
+    final isGet = cfg.method.toUpperCase() == 'GET';
+    final List<int>? reqBody = isGet ? null : utf8.encode(renderTemplate(cfg.bodyTemplate, vars));
+
+    final res = await router.sendRequest(
+      rawClient: rawClient,
+      method: isGet ? 'GET' : 'POST',
+      uri: uri,
+      headers: resolvedHeaders,
+      bodyBytes: reqBody,
+      timeout: Duration(seconds: timeoutSeconds),
+      cancelToken: cancelToken,
+    );
 
     if (res.statusCode < 200 || res.statusCode >= 300) {
       final errBody = utf8.decode(res.bodyBytes, allowMalformed: true);
@@ -426,10 +641,17 @@ class CustomTtsRunner {
     } else if (cfg.responseType == 'json_url') {
       final decoded = jsonDecode(utf8.decode(res.bodyBytes));
       final val = extractJsonPath(decoded, cfg.jsonPath);
-      if (val is! String || !val.startsWith('http')) {
+      if (val is! String || val.trim().isEmpty) {
         throw Exception('未在 JSON 路径 "${cfg.jsonPath}" 找到有效音频 URL');
       }
-      final dl = await client.get(Uri.parse(val)).timeout(Duration(seconds: timeoutSeconds));
+      final audioUri = uri.resolve(val.trim());
+      final dl = await router.sendRequest(
+        rawClient: rawClient,
+        method: 'GET',
+        uri: audioUri,
+        timeout: Duration(seconds: timeoutSeconds),
+        cancelToken: cancelToken,
+      );
       if (dl.statusCode < 200 || dl.statusCode >= 300) throw Exception('拉取音频地址失败: HTTP ${dl.statusCode}');
       audioBytes = dl.bodyBytes;
     } else {
@@ -441,11 +663,12 @@ class CustomTtsRunner {
     return audioBytes;
   }
 
-  static Future<Map<String, dynamic>> testConnectivity(CustomTtsEngineConfig cfg, http.Client client) async {
+  static Future<Map<String, dynamic>> testConnectivity(CustomTtsEngineConfig cfg, TtsNetworkRouter router) async {
     final watch = Stopwatch()..start();
     try {
       final voiceId = cfg.voices.keys.isNotEmpty ? cfg.voices.keys.first : 'default';
-      final bytes = await synthesize(cfg, '测试语音连通性。', voiceId, client: client, timeoutSeconds: 15);
+      final sample = cfg.testText.trim().isNotEmpty ? cfg.testText.trim() : '测试语音连通性。';
+      final bytes = await synthesize(cfg, sample, voiceId, router: router, timeoutSeconds: 15);
       watch.stop();
       return {'success': true, 'latency': watch.elapsedMilliseconds, 'msg': '合成测试成功 (${formatFileSize(bytes.length)})'};
     } catch (e) {
@@ -516,40 +739,100 @@ class CustomTtsRunner {
         ),
       };
 
+  static List<String> _tokenizeShellArgs(String input) {
+    final tokens = <String>[];
+    final buf = StringBuffer();
+    String? quote;
+    bool escaped = false;
+    bool hasToken = false;
+
+    for (int i = 0; i < input.length; i++) {
+      final ch = input[i];
+      if (escaped) {
+        buf.write(ch);
+        escaped = false;
+        hasToken = true;
+        continue;
+      }
+      if (ch == r'\' && quote != "'") {
+        escaped = true;
+        hasToken = true;
+        continue;
+      }
+      if (quote != null) {
+        if (ch == quote) {
+          quote = null;
+        } else {
+          buf.write(ch);
+        }
+        hasToken = true;
+        continue;
+      }
+      if (ch == "'" || ch == '"') {
+        quote = ch;
+        hasToken = true;
+        continue;
+      }
+      if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+        if (hasToken) {
+          tokens.add(buf.toString());
+          buf.clear();
+          hasToken = false;
+        }
+        continue;
+      }
+      buf.write(ch);
+      hasToken = true;
+    }
+    if (hasToken) tokens.add(buf.toString());
+    return tokens;
+  }
+
   static CustomTtsEngineConfig? parseCurl(String rawCurl, {String name = 'cURL 导入引擎'}) {
     final cleaned = rawCurl.replaceAll('\\\r\n', ' ').replaceAll('\\\n', ' ').trim();
     if (!cleaned.toLowerCase().startsWith('curl')) return null;
 
-    final urlM = RegExp(r'''(https?://[^\s'"]+)''').firstMatch(cleaned);
-    if (urlM == null) return null;
-    final url = urlM.group(1)!;
-
-    String method = 'GET';
-    final methodM = RegExp(r'''(?:-X|--request)\s+['"]?([A-Za-z]+)['"]?''').firstMatch(cleaned);
-    if (methodM != null) {
-      method = methodM.group(1)!.toUpperCase();
-    }
-
+    final args = _tokenizeShellArgs(cleaned);
+    String url = '';
+    String method = '';
     final headers = <String, String>{};
-    for (final hm in RegExp(r'''(?:-H|--header)\s+(['"])(.*?)\1''').allMatches(cleaned)) {
-      final kv = hm.group(2)!;
-      final idx = kv.indexOf(':');
-      if (idx > 0) {
-        headers[kv.substring(0, idx).trim()] = kv.substring(idx + 1).trim();
+    final bodyParts = <String>[];
+
+    for (int i = 1; i < args.length; i++) {
+      final arg = args[i];
+      if ((arg == '-X' || arg == '--request') && i + 1 < args.length) {
+        method = args[++i].toUpperCase();
+      } else if (arg.startsWith('-X') && arg.length > 2) {
+        method = arg.substring(2).toUpperCase();
+      } else if ((arg == '-H' || arg == '--header') && i + 1 < args.length) {
+        final kv = args[++i];
+        final idx = kv.indexOf(':');
+        if (idx > 0) headers[kv.substring(0, idx).trim()] = kv.substring(idx + 1).trim();
+      } else if ((arg == '-d' || arg == '--data' || arg == '--data-raw' || arg == '--data-binary' || arg == '--data-urlencode') &&
+          i + 1 < args.length) {
+        bodyParts.add(args[++i]);
+      } else if (arg == '--url' && i + 1 < args.length) {
+        url = args[++i];
+      } else if (!arg.startsWith('-') && (arg.startsWith('http://') || arg.startsWith('https://')) && url.isEmpty) {
+        url = arg;
       }
     }
 
-    String body = '';
-    final dataM = RegExp(r'''(?:--data-raw|--data|-d)\s+(['"])([\s\S]*?)\1''').firstMatch(cleaned);
-    if (dataM != null) {
-      body = dataM.group(2)!;
-      if (methodM == null) method = 'POST';
+    if (url.isEmpty) {
+      final urlM = RegExp(r'''(https?://[^\s'"]+)''').firstMatch(cleaned);
+      if (urlM == null) return null;
+      url = urlM.group(1)!;
+    }
+
+    final body = bodyParts.join('&');
+    if (method.isEmpty) {
+      method = body.isNotEmpty ? 'POST' : 'GET';
     }
 
     return CustomTtsEngineConfig(
       id: 'custom_${DateTime.now().millisecondsSinceEpoch}',
       name: name,
-      method: method,
+      method: method == 'GET' ? 'GET' : 'POST',
       url: url,
       headers: headers.isEmpty ? {'Content-Type': 'application/json'} : headers,
       bodyTemplate: body,
@@ -570,17 +853,42 @@ Future<Uint8List> synthesizeWithEngine({
   required FishAudioTTS fishTts,
   required List<CustomTtsEngineConfig> customEngines,
   required TtsNetworkRouter networkRouter,
+  TtsCancelToken? cancelToken,
 }) async {
-  final client = networkRouter.getClientForEngine(engineId, customEngines);
   if (engineId == 'ms') {
-    return MicrosoftTranslatorTTS.synthesize(text, voiceId, client: client, speed: speed, bitrate: bitrate, timeoutSeconds: timeoutSeconds);
+    return MicrosoftTranslatorTTS.synthesize(
+      text,
+      voiceId,
+      router: networkRouter,
+      speed: speed,
+      bitrate: bitrate,
+      timeoutSeconds: timeoutSeconds,
+      cancelToken: cancelToken,
+    );
   }
   if (engineId == 'fish') {
-    return fishTts.textToSpeech(text, voiceId, client: client, speed: speed, bitrate: bitrate, timeoutSeconds: timeoutSeconds);
+    return fishTts.textToSpeech(
+      text,
+      voiceId,
+      router: networkRouter,
+      speed: speed,
+      bitrate: bitrate,
+      timeoutSeconds: timeoutSeconds,
+      cancelToken: cancelToken,
+    );
   }
   final custom = customEngines.cast<CustomTtsEngineConfig?>().firstWhere((e) => e?.id == engineId, orElse: () => null);
   if (custom == null) {
     throw Exception('找不到 TTS 引擎 ($engineId)，可能已被删除');
   }
-  return CustomTtsRunner.synthesize(custom, text, voiceId, client: client, speed: speed, bitrate: bitrate, timeoutSeconds: timeoutSeconds);
+  return CustomTtsRunner.synthesize(
+    custom,
+    text,
+    voiceId,
+    router: networkRouter,
+    speed: speed,
+    bitrate: bitrate,
+    timeoutSeconds: timeoutSeconds,
+    cancelToken: cancelToken,
+  );
 }
