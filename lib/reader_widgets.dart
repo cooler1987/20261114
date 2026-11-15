@@ -6,7 +6,7 @@ import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import 'models.dart';
 
-// ────────────────── 1. 微信读书质感底部悬浮播控仓 ──────────────────
+// ────────────────── 1. 微信读书质感底部悬浮播控仓 (支持 3 态网络图标标识) ──────────────────
 class WeReadPlayerBar extends StatelessWidget {
   final bool isWide;
   final String engineLabel;
@@ -19,7 +19,7 @@ class WeReadPlayerBar extends StatelessWidget {
   final bool isPlaying;
   final bool isBuffering;
   final bool followAlong;
-  final bool isDirectNetwork;
+  final String networkRoute; // 'direct' | 'system' | 'custom'
 
   final VoidCallback onVoiceTap;
   final VoidCallback onSpeedTap;
@@ -45,7 +45,7 @@ class WeReadPlayerBar extends StatelessWidget {
     required this.isPlaying,
     required this.isBuffering,
     required this.followAlong,
-    required this.isDirectNetwork,
+    required this.networkRoute,
     required this.onVoiceTap,
     required this.onSpeedTap,
     required this.onSleepTimerTap,
@@ -57,6 +57,18 @@ class WeReadPlayerBar extends StatelessWidget {
     required this.onToggleFollowAlong,
     required this.onExportTap,
   });
+
+  IconData _routeIcon() {
+    if (networkRoute == 'system') return Icons.laptop_windows_outlined;
+    if (networkRoute == 'custom') return Icons.vpn_lock;
+    return Icons.public;
+  }
+
+  String _routeTag() {
+    if (networkRoute == 'system') return '系统代理';
+    if (networkRoute == 'custom') return '自定代理';
+    return '直连';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -86,10 +98,9 @@ class WeReadPlayerBar extends StatelessWidget {
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(
-                          isDirectNetwork ? Icons.public : Icons.vpn_lock,
-                          size: 13,
-                          color: const Color(0xFFC87D2E),
+                        Tooltip(
+                          message: "当前网络连接: ${_routeTag()}",
+                          child: Icon(_routeIcon(), size: 13, color: const Color(0xFFC87D2E)),
                         ),
                         const SizedBox(width: 5),
                         Flexible(
@@ -411,7 +422,6 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
             Expanded(
               child: Builder(
                 builder: (context) {
-                  // Tab 0: 章节目录 (自动居中定位 + 双热区折叠)
                   if (widget.sidebarTab == 0) {
                     if (widget.chapters.isEmpty) {
                       return const Center(child: Text("当前图书无大纲目录", style: TextStyle(color: Colors.grey, fontSize: 13)));
@@ -507,7 +517,6 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                     );
                   }
 
-                  // Tab 1: 个人书架
                   if (widget.sidebarTab == 1) {
                     if (widget.bookList.isEmpty) {
                       return const Center(child: Text("书架空空如也\n请在右上角导入图书", textAlign: TextAlign.center, style: TextStyle(color: Colors.grey, fontSize: 13)));
@@ -602,7 +611,6 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                     );
                   }
 
-                  // Tab 2: 精彩书签
                   if (widget.bookmarks.isEmpty) {
                     return const Center(
                       child: Padding(
