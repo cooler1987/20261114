@@ -10,59 +10,71 @@ import 'package:http/io_client.dart';
 import 'models.dart';
 import 'system_utils.dart';
 
-// ────────────────── 分引擎连接池与网络路由器 (默认直连) ──────────────────
+// ────────────────── 分引擎连接池与 3 态网络路由器 (直连 / 系统代理 / 自定义代理端口) ──────────────────
 class TtsNetworkRouter {
-  String proxyMode = 'auto'; // 'auto' | 'manual'
-  String customProxy = '';
-  String? _resolvedProxy;
+  String? detectedSystemProxy;
   Map<String, String> engineNetworkModes = {'ms': 'direct', 'fish': 'direct'};
+  Map<String, String> engineCustomProxies = {};
 
   IOClient? _directClient;
-  IOClient? _proxyClient;
-  String? _proxyClientAddr;
+  final Map<String, IOClient> _proxyClients = {};
 
-  Future<void> refreshProxy() async {
-    if (proxyMode == 'manual') {
-      _resolvedProxy = customProxy.trim().isNotEmpty ? customProxy.trim() : null;
-    } else {
-      _resolvedProxy = await detectSystemProxy();
-    }
-    if (_proxyClient != null && _proxyClientAddr != _resolvedProxy) {
-      _proxyClient?.close();
-      _proxyClient = null;
-      _proxyClientAddr = null;
-    }
-    AppLogger.log("代理配置已刷新 [全局代理方式: $proxyMode, 探测地址: ${_resolvedProxy ?? '无(回退直连)'}]");
+  Future<String?> refreshSystemProxy() async {
+    detectedSystemProxy = await detectSystemProxy();
+    AppLogger.log("系统代理探测完成: ${detectedSystemProxy ?? '未检测到系统代理'}", null, null, true);
+    return detectedSystemProxy;
   }
 
   String getEngineRoute(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
     if (customEngines != null) {
       for (final c in customEngines) {
-        if (c.id == engineId) return c.networkMode;
+        if (c.id == engineId) return normalizeEngineNetworkMode(c.networkMode);
       }
     }
-    return engineNetworkModes[engineId] == 'proxy' ? 'proxy' : 'direct';
+    return normalizeEngineNetworkMode(engineNetworkModes[engineId]);
   }
 
-  void setEngineRoute(String engineId, String mode) {
-    engineNetworkModes[engineId] = (mode == 'proxy') ? 'proxy' : 'direct';
+  String getEngineCustomProxy(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
+    if (customEngines != null) {
+      for (final c in customEngines) {
+        if (c.id == engineId) return normalizeProxyInput(c.customProxy);
+      }
+    }
+    return normalizeProxyInput(engineCustomProxies[engineId] ?? '');
+  }
+
+  void setEngineNetwork(String engineId, String mode, [String customProxy = '']) {
+    engineNetworkModes[engineId] = normalizeEngineNetworkMode(mode);
+    final normProxy = normalizeProxyInput(customProxy);
+    if (normProxy.isNotEmpty) {
+      engineCustomProxies[engineId] = normProxy;
+    } else if (customProxy.trim().isEmpty) {
+      engineCustomProxies.remove(engineId);
+    }
+  }
+
+  IOClient _getOrCreateProxyClient(String addr) {
+    return _proxyClients.putIfAbsent(addr, () {
+      final raw = HttpClient();
+      raw.findProxy = (_) => "PROXY $addr; DIRECT";
+      raw.connectionTimeout = const Duration(seconds: 15);
+      raw.idleTimeout = const Duration(seconds: 30);
+      raw.badCertificateCallback = (_, __, ___) => true;
+      return IOClient(raw);
+    });
   }
 
   http.Client getClientForEngine(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
     final route = getEngineRoute(engineId, customEngines);
-    if (route == 'proxy' && _resolvedProxy != null && _resolvedProxy!.isNotEmpty) {
-      if (_proxyClient == null || _proxyClientAddr != _resolvedProxy) {
-        final raw = HttpClient();
-        final addr = _resolvedProxy!;
-        raw.findProxy = (_) => "PROXY $addr; DIRECT";
-        raw.connectionTimeout = const Duration(seconds: 15);
-        raw.idleTimeout = const Duration(seconds: 30);
-        // 仅在使用代理时兼容自签调试代理证书
-        raw.badCertificateCallback = (_, __, ___) => true;
-        _proxyClient = IOClient(raw);
-        _proxyClientAddr = addr;
+    if (route == 'system') {
+      if (detectedSystemProxy != null && detectedSystemProxy!.isNotEmpty) {
+        return _getOrCreateProxyClient(detectedSystemProxy!);
       }
-      return _proxyClient!;
+    } else if (route == 'custom') {
+      final customAddr = getEngineCustomProxy(engineId, customEngines);
+      if (customAddr.isNotEmpty) {
+        return _getOrCreateProxyClient(customAddr);
+      }
     }
 
     _directClient ??= IOClient(
@@ -76,9 +88,11 @@ class TtsNetworkRouter {
 
   void dispose() {
     _directClient?.close();
-    _proxyClient?.close();
     _directClient = null;
-    _proxyClient = null;
+    for (final c in _proxyClients.values) {
+      c.close();
+    }
+    _proxyClients.clear();
   }
 }
 
@@ -440,7 +454,6 @@ class CustomTtsRunner {
     }
   }
 
-  /// 内置常用代码模板，供用户一键插入后微调
   static Map<String, CustomTtsEngineConfig> presetTemplates() => {
         'fish_relay': CustomTtsEngineConfig(
           id: 'tpl_fish_relay',
@@ -503,7 +516,6 @@ class CustomTtsRunner {
         ),
       };
 
-  /// 从粘贴的 cURL 命令自动解析为引擎配置
   static CustomTtsEngineConfig? parseCurl(String rawCurl, {String name = 'cURL 导入引擎'}) {
     final cleaned = rawCurl.replaceAll('\\\r\n', ' ').replaceAll('\\\n', ' ').trim();
     if (!cleaned.toLowerCase().startsWith('curl')) return null;
