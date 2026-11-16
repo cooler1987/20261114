@@ -81,7 +81,7 @@ class WeReadPlayerBar extends StatelessWidget {
         color: const Color(0xFFFCFBF7),
         borderRadius: BorderRadius.circular(22),
         border: Border.all(color: const Color(0xFFE5E2D9), width: 1),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.06), blurRadius: 14, offset: const Offset(0, 4))],
+        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.08), blurRadius: 14, offset: const Offset(0, 4))],
       ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -368,7 +368,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
         child: Column(
           children: [
             Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              padding: const EdgeInsets.fromLTRB(8, 8, 4, 8),
               child: Row(
                 children: [
                   Expanded(
@@ -399,6 +399,12 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                       selectedColor: Colors.white,
                       onSelected: (_) => widget.onTabChanged(2),
                     ),
+                  ),
+                  IconButton(
+                    visualDensity: VisualDensity.compact,
+                    icon: const Icon(Icons.close, size: 19, color: Colors.blueGrey),
+                    tooltip: "收起侧边栏",
+                    onPressed: () => Navigator.pop(context),
                   ),
                 ],
               ),
@@ -616,7 +622,7 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
                       child: Padding(
                         padding: EdgeInsets.all(24),
                         child: Text(
-                          "当前图书暂无书签\n\n在正文长按或右键句子\n即可在此添加书签",
+                          "当前图书暂无书签\n\n长按正文呼出菜单即可添加书签",
                           textAlign: TextAlign.center,
                           style: TextStyle(color: Colors.grey, fontSize: 13, height: 1.5),
                         ),
@@ -748,9 +754,10 @@ class _ReaderSidebarState extends State<ReaderSidebar> {
   }
 }
 
-// ────────────────── 3. 空白无书时的初始展示层 ──────────────────
+// ────────────────── 3. 空白无书时的初始展示层 (适配自定义阅读背景色) ──────────────────
 class EmptyBookshelfView extends StatelessWidget {
   final List<BookHistoryItem> bookList;
+  final Color readingBgColor;
   final VoidCallback onImportFile;
   final ValueChanged<String> onOpenBook;
   final ValueChanged<BookHistoryItem> onRelinkBook;
@@ -758,6 +765,7 @@ class EmptyBookshelfView extends StatelessWidget {
   const EmptyBookshelfView({
     super.key,
     required this.bookList,
+    this.readingBgColor = const Color(defaultReadingBgColorValue),
     required this.onImportFile,
     required this.onOpenBook,
     required this.onRelinkBook,
@@ -765,75 +773,86 @@ class EmptyBookshelfView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 20),
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            ElevatedButton.icon(
-              icon: const Icon(Icons.auto_stories, color: Color(0xFFC87D2E), size: 24),
-              label: const Text("原位打开 TXT / EPUB / MD (零拷贝)", style: TextStyle(color: Color(0xFF2C3238), fontSize: 16)),
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFFCFBF7),
-                elevation: 1,
-                padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-                side: const BorderSide(color: Color(0xFFE9E7DE)),
-              ),
-              onPressed: onImportFile,
-            ),
-            if (bookList.isNotEmpty) ...[
-              const SizedBox(height: 32),
-              const Text("📚 最近阅读书架 (基于文件指纹原位承接):", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.blueGrey, fontSize: 14)),
-              const SizedBox(height: 12),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 550),
-                child: Card(
-                  child: ListView.separated(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: min(bookList.length, 6),
-                    separatorBuilder: (_, __) => const Divider(height: 1),
-                    itemBuilder: (ctx, idx) {
-                      final item = bookList[idx];
-                      final bool fileExists = File(item.lastKnownPath).existsSync();
-                      final sizeStr = item.fileSize > 0 ? formatFileSize(item.fileSize) : "";
+    final labelColor = getContrastTextColor(readingBgColor).withOpacity(0.85);
 
-                      return ListTile(
-                        dense: true,
-                        title: Text(
-                          item.bookName,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontWeight: FontWeight.bold,
-                            fontSize: 13,
-                            height: 1.25,
-                            color: fileExists ? const Color(0xFF2C3238) : Colors.redAccent,
+    return Container(
+      color: readingBgColor,
+      width: double.infinity,
+      height: double.infinity,
+      child: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 20),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              ElevatedButton.icon(
+                icon: const Icon(Icons.auto_stories, color: Color(0xFFC87D2E), size: 24),
+                label: const Text("原位打开 TXT / EPUB / MD (零拷贝)", style: TextStyle(color: Color(0xFF2C3238), fontSize: 16)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFFFCFBF7),
+                  elevation: 1.5,
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                  side: const BorderSide(color: Color(0xFFE9E7DE)),
+                ),
+                onPressed: onImportFile,
+              ),
+              if (bookList.isNotEmpty) ...[
+                const SizedBox(height: 32),
+                Text(
+                  "📚 最近阅读书架 (基于文件指纹原位承接):",
+                  style: TextStyle(fontWeight: FontWeight.bold, color: labelColor, fontSize: 14),
+                ),
+                const SizedBox(height: 12),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 550),
+                  child: Card(
+                    color: const Color(0xFFFCFBF7),
+                    child: ListView.separated(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      itemCount: min(bookList.length, 6),
+                      separatorBuilder: (_, __) => const Divider(height: 1),
+                      itemBuilder: (ctx, idx) {
+                        final item = bookList[idx];
+                        final bool fileExists = File(item.lastKnownPath).existsSync();
+                        final sizeStr = item.fileSize > 0 ? formatFileSize(item.fileSize) : "";
+
+                        return ListTile(
+                          dense: true,
+                          title: Text(
+                            item.bookName,
+                            maxLines: 2,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                              height: 1.25,
+                              color: fileExists ? const Color(0xFF2C3238) : Colors.redAccent,
+                            ),
                           ),
-                        ),
-                        subtitle: Row(
-                          children: [
-                            if (sizeStr.isNotEmpty) Text("$sizeStr · ", style: const TextStyle(fontSize: 10, color: Colors.blueGrey)),
-                            Text("上次读到: ${(item.percentage * 100).toStringAsFixed(1)}%", style: const TextStyle(fontSize: 10, color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
-                            if (!fileExists)
-                              const Padding(padding: EdgeInsets.only(left: 6), child: Text("(未连接·点击重链)", style: TextStyle(fontSize: 10, color: Colors.redAccent))),
-                          ],
-                        ),
-                        onTap: () {
-                          if (fileExists) {
-                            onOpenBook(item.lastKnownPath);
-                          } else {
-                            onRelinkBook(item);
-                          }
-                        },
-                      );
-                    },
+                          subtitle: Row(
+                            children: [
+                              if (sizeStr.isNotEmpty) Text("$sizeStr · ", style: const TextStyle(fontSize: 10, color: Colors.blueGrey)),
+                              Text("上次读到: ${(item.percentage * 100).toStringAsFixed(1)}%", style: const TextStyle(fontSize: 10, color: Color(0xFFC87D2E), fontWeight: FontWeight.bold)),
+                              if (!fileExists)
+                                const Padding(padding: EdgeInsets.only(left: 6), child: Text("(未连接·点击重链)", style: TextStyle(fontSize: 10, color: Colors.redAccent))),
+                            ],
+                          ),
+                          onTap: () {
+                            if (fileExists) {
+                              onOpenBook(item.lastKnownPath);
+                            } else {
+                              onRelinkBook(item);
+                            }
+                          },
+                        );
+                      },
+                    ),
                   ),
                 ),
-              ),
+              ],
             ],
-          ],
+          ),
         ),
       ),
     );
