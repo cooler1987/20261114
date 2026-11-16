@@ -78,7 +78,7 @@ jobs:
 
   build_windows_portable:
     name: Build Windows Portable ZIP
-    runs-on: windows-latest
+    runs-on: windows-2022
 
     steps:
       - name: Checkout Code
