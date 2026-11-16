@@ -2,8 +2,8 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -25,7 +25,126 @@ class _StorageEntry {
   });
 }
 
-// ────────────────── A 存储权限与专业物理路径文件管理器 (完整文件名防截断) ──────────────────
+// ────────────────── Android 原生网络与边缘手势桥接 ──────────────────
+class AndroidNetworkState {
+  final String? systemProxy;
+  final bool hasVpn;
+  final bool hasBypassNetwork;
+  final String summary;
+
+  const AndroidNetworkState({
+    this.systemProxy,
+    this.hasVpn = false,
+    this.hasBypassNetwork = false,
+    this.summary = '',
+  });
+}
+
+class NativeHttpResult {
+  final int statusCode;
+  final Uint8List bodyBytes;
+  final Map<String, String> headers;
+
+  const NativeHttpResult({
+    required this.statusCode,
+    required this.bodyBytes,
+    required this.headers,
+  });
+}
+
+class AndroidNativeBridge {
+  static const MethodChannel _channel = MethodChannel('fish_reader/native');
+  static bool _handlerRegistered = false;
+  static void Function(String edge)? _onEdgeBackCallback;
+
+  static void registerEdgeBackListener(void Function(String edge) callback) {
+    _onEdgeBackCallback = callback;
+    if (_handlerRegistered || !Platform.isAndroid) return;
+    _handlerRegistered = true;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onEdgeBack') {
+        final edge = (call.arguments is Map ? call.arguments['edge'] : null)?.toString() ?? 'unknown';
+        _onEdgeBackCallback?.call(edge);
+      }
+      return null;
+    });
+  }
+
+  static Future<void> updateEdgeGestureConfig({
+    required bool interceptHomeBack,
+    required bool excludeEdges,
+    required double screenWidthDp,
+    required double screenHeightDp,
+    required double devicePixelRatio,
+  }) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod('setEdgeGestureConfig', {
+        'interceptHomeBack': interceptHomeBack,
+        'excludeEdges': excludeEdges,
+        'screenWidthDp': screenWidthDp,
+        'screenHeightDp': screenHeightDp,
+        'density': devicePixelRatio,
+      });
+    } catch (_) {}
+  }
+
+  static Future<AndroidNetworkState> getNetworkState() async {
+    if (!Platform.isAndroid) {
+      return const AndroidNetworkState();
+    }
+    try {
+      final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>('getNetworkState');
+      if (raw == null) return const AndroidNetworkState();
+      final proxyRaw = raw['systemProxy']?.toString() ?? '';
+      final proxyNorm = normalizeProxyInput(proxyRaw);
+      return AndroidNetworkState(
+        systemProxy: proxyNorm.isEmpty ? null : proxyNorm,
+        hasVpn: raw['hasVpn'] == true,
+        hasBypassNetwork: raw['hasBypassNetwork'] == true,
+        summary: raw['summary']?.toString() ?? '',
+      );
+    } catch (_) {
+      return const AndroidNetworkState();
+    }
+  }
+
+  static Future<NativeHttpResult> nativeHttpRequest({
+    required String method,
+    required String url,
+    required Map<String, String> headers,
+    Uint8List? bodyBytes,
+    int timeoutMs = 60000,
+    bool bypassVpn = true,
+  }) async {
+    final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>('nativeHttpRequest', {
+      'method': method,
+      'url': url,
+      'headers': headers,
+      'bodyBytes': bodyBytes,
+      'timeoutMs': timeoutMs,
+      'bypassVpn': bypassVpn,
+    });
+    if (raw == null) {
+      throw const SocketException('原生网络桥接未返回响应');
+    }
+    final statusCode = (raw['statusCode'] as num?)?.toInt() ?? 0;
+    final dynamic rawBody = raw['bodyBytes'];
+    final Uint8List bytes = rawBody is Uint8List
+        ? rawBody
+        : (rawBody is List ? Uint8List.fromList(rawBody.cast<int>()) : Uint8List(0));
+    final respHeaders = <String, String>{};
+    final rawHeaders = raw['headers'];
+    if (rawHeaders is Map) {
+      rawHeaders.forEach((k, v) {
+        if (k != null && v != null) respHeaders[k.toString().toLowerCase()] = v.toString();
+      });
+    }
+    return NativeHttpResult(statusCode: statusCode, bodyBytes: bytes, headers: respHeaders);
+  }
+}
+
+// ────────────────── 存储权限与专业物理路径文件管理器 (完整文件名防截断) ──────────────────
 class StorageHelper {
   static Future<bool> checkAndRequestManagePermission() async {
     if (!Platform.isAndroid) return true;
@@ -347,7 +466,6 @@ class AppLogger {
 String normalizeProxyInput(String raw) {
   var cleaned = raw.trim().replaceAll(RegExp(r'^https?://', caseSensitive: false), '').replaceAll(RegExp(r'/$'), '');
   if (cleaned.isEmpty) return '';
-  // 若用户仅输入端口号如 "7890"，自动补全为本机回环地址
   if (RegExp(r'^\d{1,5}$').hasMatch(cleaned)) {
     return '127.0.0.1:$cleaned';
   }
@@ -394,8 +512,12 @@ Future<String?> detectSystemProxy() async {
     } catch (_) {}
   }
 
-  // 3. Android 尝试读取系统属性代理
+  // 3. Android 优先通过 ConnectivityManager 获取真实系统代理，失败再尝试 settings
   if (Platform.isAndroid) {
+    final state = await AndroidNativeBridge.getNetworkState();
+    if (state.systemProxy != null && state.systemProxy!.isNotEmpty) {
+      return state.systemProxy;
+    }
     try {
       final res = await Process.run('settings', ['get', 'global', 'http_proxy']);
       if (res.exitCode == 0) {
