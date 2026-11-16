@@ -22,6 +22,8 @@ import 'reader_widgets.dart';
 import 'system_utils.dart';
 import 'tts_engines.dart';
 
+final RouteObserver<ModalRoute<void>> appRouteObserver = RouteObserver<ModalRoute<void>>();
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await AppLogger.init();
@@ -41,8 +43,9 @@ class FishAudioReaderApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: '鱼听书 (微信读书质感版)',
+      title: '鱼听书',
       debugShowCheckedModeBanner: false,
+      navigatorObservers: [appRouteObserver],
       theme: ThemeData(
         useMaterial3: true,
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF2C3238), surface: const Color(0xFFFCFBF7)),
@@ -67,7 +70,7 @@ class ReaderHomeScreen extends StatefulWidget {
   State<ReaderHomeScreen> createState() => _ReaderHomeScreenState();
 }
 
-class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBindingObserver {
+class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBindingObserver, RouteAware {
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   final AudioPlayer _audioPlayer = AudioPlayer();
   final ItemScrollController _itemScrollController = ItemScrollController();
@@ -95,7 +98,9 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   int _maxCacheCount = 100;
   bool _followAlong = true;
   String _splitMode = 'sentence';
-  double _fontSize = 14.0; // 默认 14px，10-20px 设置页调节
+  double _fontSize = 14.0;
+  int _readingBgColorValue = defaultReadingBgColorValue; // 默认羊皮纸色 #D2B48C
+  int _readingHighlightColorValue = defaultReadingHighlightColorValue;
 
   String _lastBookDir = "";
   String _lastBackupDir = StorageHelper.getDefaultBackupDir();
@@ -106,12 +111,14 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   String? _currentFingerprint;
   String? _currentFilePath;
   String? _currentBookName;
+  bool _isTemporaryClipboardBook = false;
   String _fullContent = "";
   int _fileSize = 0;
   List<BookChapter> _rawChapters = [];
   List<BookChapter> _alignedChapters = [];
   List<TextSliceNode> _nodes = [];
   int _currentIndex = 0;
+  int _contextTargetSliceIndex = 0;
 
   // 播放状态机与代际去重缓存
   bool _isPlaying = false;
@@ -141,9 +148,19 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   final Set<String> _selectedFingerprints = {};
   int _lastBackPressTime = 0;
   bool _showBackToCurrent = false;
+  bool _isTopRoute = true;
+  bool _isVoiceDialogOpen = false;
+  bool _isDrawerOpen = false;
 
-  List<BookBookmark> get _currentBookBookmarks =>
-      _bookmarks.where((b) => b.bookFingerprint == _currentFingerprint).toList();
+  // 边缘滑动检测状态
+  double? _edgeDragStartX;
+  double _edgeDragAccumDx = 0;
+  bool _edgeDragHandled = false;
+
+  List<BookBookmark> get _currentBookBookmarks {
+    if (_isTemporaryClipboardBook || _currentFingerprint == null) return const [];
+    return _bookmarks.where((b) => b.bookFingerprint == _currentFingerprint).toList();
+  }
 
   @override
   void initState() {
@@ -151,10 +168,47 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     WidgetsBinding.instance.addObserver(this);
     _loadSettingsAndHistory();
     _initAudioSession();
+    AndroidNativeBridge.registerEdgeBackListener(_handleNativeEdgeBack);
     _exportController.addListener(() {
       if (mounted) setState(() {});
     });
     _itemPositionsListener.itemPositions.addListener(_onViewportPositionsChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _syncAndroidEdgeGestureConfig());
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route != null) {
+      appRouteObserver.subscribe(this, route);
+    }
+    _syncAndroidEdgeGestureConfig();
+  }
+
+  @override
+  void didPushNext() {
+    _isTopRoute = false;
+    _syncAndroidEdgeGestureConfig();
+  }
+
+  @override
+  void didPopNext() {
+    _isTopRoute = true;
+    _syncAndroidEdgeGestureConfig();
+  }
+
+  void _syncAndroidEdgeGestureConfig() {
+    if (!Platform.isAndroid || !mounted) return;
+    final mq = MediaQuery.maybeOf(context);
+    if (mq == null) return;
+    AndroidNativeBridge.updateEdgeGestureConfig(
+      interceptHomeBack: _isTopRoute,
+      excludeEdges: _isTopRoute,
+      screenWidthDp: mq.size.width,
+      screenHeightDp: mq.size.height,
+      devicePixelRatio: mq.devicePixelRatio,
+    );
   }
 
   void _onViewportPositionsChanged() {
@@ -169,6 +223,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
 
   @override
   void dispose() {
+    appRouteObserver.unsubscribe(this);
     WidgetsBinding.instance.removeObserver(this);
     _itemPositionsListener.itemPositions.removeListener(_onViewportPositionsChanged);
     _noisySub?.cancel();
@@ -187,7 +242,10 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive || state == AppLifecycleState.detached) {
+    if (state == AppLifecycleState.resumed) {
+      _networkRouter.refreshSystemProxy();
+      _syncAndroidEdgeGestureConfig();
+    } else if (state == AppLifecycleState.paused || state == AppLifecycleState.inactive || state == AppLifecycleState.detached) {
       _saveHistoryToPrefs(immediate: true);
       _saveSettings();
     }
@@ -234,9 +292,10 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     _followAlong = prefs.getBool('followAlong') ?? true;
     _splitMode = prefs.getString('splitMode') ?? 'sentence';
     _fontSize = (prefs.getDouble('font_size_v2') ?? 14.0).clamp(10.0, 20.0);
+    _readingBgColorValue = prefs.getInt('reading_bg_color_v1') ?? defaultReadingBgColorValue;
+    _readingHighlightColorValue = prefs.getInt('reading_highlight_color_v1') ?? defaultReadingHighlightColorValue;
     AppLogger.logLevel = AppLogger.normalizeLevel(prefs.getString('log_level'));
 
-    // 分引擎 3 态网络路由 + 自定义代理端口
     final rawRoutes = prefs.getString('engine_network_modes');
     if (rawRoutes != null) {
       try {
@@ -254,7 +313,6 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       } catch (_) {}
     }
 
-    // 自定义 TTS 引擎列表
     final rawCustom = prefs.getString('custom_tts_engines_v1');
     if (rawCustom != null) {
       try {
@@ -355,6 +413,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     await prefs.setBool('followAlong', _followAlong);
     await prefs.setString('splitMode', _splitMode);
     await prefs.setDouble('font_size_v2', _fontSize);
+    await prefs.setInt('reading_bg_color_v1', _readingBgColorValue);
+    await prefs.setInt('reading_highlight_color_v1', _readingHighlightColorValue);
     await prefs.setString('log_level', AppLogger.logLevel);
 
     await prefs.setString('custom_user_fish_voices', jsonEncode(_userFishVoices));
@@ -368,7 +428,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   }
 
   Future<void> _saveHistoryToPrefs({bool immediate = false}) async {
-    if (_currentFingerprint != null && _currentFilePath != null && _nodes.isNotEmpty) {
+    // 临时剪贴板导入文本绝不进入历史记录
+    if (!_isTemporaryClipboardBook && _currentFingerprint != null && _currentFilePath != null && _nodes.isNotEmpty) {
       final validIdx = _currentIndex.clamp(0, _nodes.length - 1);
       final node = _nodes[validIdx];
       final snippet = node.text.length > 30 ? node.text.substring(0, 30) : node.text;
@@ -424,6 +485,12 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   }
 
   void _addBookmarkAt(int paragraphIndex) {
+    if (_isTemporaryClipboardBook) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("临时剪贴板文本不支持保存书签"), duration: Duration(seconds: 2)),
+      );
+      return;
+    }
     if (_nodes.isEmpty || paragraphIndex < 0 || paragraphIndex >= _nodes.length || _currentFingerprint == null) return;
 
     final node = _nodes[paragraphIndex];
@@ -467,6 +534,135 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     );
   }
 
+  // ────────── 剪贴板写入与复制本章节 / 复制全文（防卡死，不弹窗） ──────────
+  Future<void> _copyToClipboardSafely(String text, String successMsg) async {
+    if (text.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("没有可复制的文本内容")));
+      }
+      return;
+    }
+    try {
+      await Clipboard.setData(ClipboardData(text: text));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(successMsg), duration: const Duration(seconds: 2)),
+        );
+      }
+    } catch (e) {
+      AppLogger.log("写入系统剪贴板失败", e);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text("复制失败：文本过大超出系统剪贴板单次上限，建议改用「复制本章节」")),
+        );
+      }
+    }
+  }
+
+  Future<void> _copyChapterAt(int targetSliceIdx) async {
+    if (_fullContent.isEmpty || _nodes.isEmpty) return;
+    if (_alignedChapters.isEmpty) {
+      await _copyToClipboardSafely(_fullContent.trim(), "当前文本无章节目录，已复制全部内容（共 ${_fullContent.trim().length} 字）");
+      return;
+    }
+
+    final safeIdx = targetSliceIdx.clamp(0, _nodes.length - 1);
+    int chapIdx = 0;
+    for (int i = _alignedChapters.length - 1; i >= 0; i--) {
+      if (_alignedChapters[i].paragraphIndex <= safeIdx) {
+        chapIdx = i;
+        break;
+      }
+    }
+
+    final startOffset = _alignedChapters[chapIdx].charOffset.clamp(0, _fullContent.length);
+    final endOffset = (chapIdx + 1 < _alignedChapters.length)
+        ? _alignedChapters[chapIdx + 1].charOffset.clamp(startOffset, _fullContent.length)
+        : _fullContent.length;
+    final chapterText = _fullContent.substring(startOffset, endOffset).trim();
+
+    await _copyToClipboardSafely(
+      chapterText,
+      "已复制「${_alignedChapters[chapIdx].title}」（共 ${chapterText.length} 字）",
+    );
+  }
+
+  Future<void> _copyFullText() async {
+    final full = _fullContent.trim();
+    await _copyToClipboardSafely(full, "已复制全文（共 ${full.length} 字）");
+  }
+
+  // ────────── 剪贴板导入（临时文本，不写历史、不进备份、退出清除） ──────────
+  Future<void> _importFromClipboard() async {
+    try {
+      final data = await Clipboard.getData(Clipboard.kTextPlain);
+      final rawText = data?.text ?? "";
+      if (rawText.trim().isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("剪贴板暂无可导入的文本内容")));
+        }
+        return;
+      }
+
+      await _stopTTS();
+      await _saveHistoryToPrefs(immediate: true);
+
+      if (!mounted) return;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const Center(child: Card(child: Padding(padding: EdgeInsets.all(24), child: CircularProgressIndicator()))),
+      );
+
+      final res = await BookParser.parseRawTextInIsolate(rawText, _splitMode);
+      if (mounted && Navigator.canPop(context)) Navigator.pop(context);
+
+      final String full = res['fullContent'] as String;
+      final List<BookChapter> rawChapters = res['rawChapters'] as List<BookChapter>;
+      final List<BookChapter> aligned = res['alignedChapters'] as List<BookChapter>;
+      final List<TextSliceNode> nodes = res['nodes'] as List<TextSliceNode>;
+
+      if (nodes.isEmpty) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("剪贴板内容无可朗读文字")));
+        }
+        return;
+      }
+
+      AppLogger.log("剪贴板临时文本导入成功 [切片: ${nodes.length}, 章节: ${rawChapters.length}]", null, null, true);
+
+      if (!mounted) return;
+      setState(() {
+        _isTemporaryClipboardBook = true;
+        _currentFingerprint = null;
+        _currentFilePath = null;
+        _currentBookName = "📋 剪贴板临时阅读";
+        _fullContent = full;
+        _fileSize = utf8.encode(rawText).length;
+        _rawChapters = rawChapters;
+        _alignedChapters = aligned;
+        _nodes = nodes;
+        _currentIndex = 0;
+        _contextTargetSliceIndex = 0;
+        _invalidateAudioCache();
+        _searchResults.clear();
+        _activeSearchQuery = "";
+        _showBackToCurrent = false;
+      });
+
+      WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToCurrentCenter(immediate: true, force: true));
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("已导入剪贴板文本（共 ${nodes.length} 朗读单元 · 退出后自动清除）")),
+        );
+      }
+    } catch (e, stack) {
+      AppLogger.log("剪贴板导入失败", e, stack);
+      if (mounted && Navigator.canPop(context)) Navigator.pop(context);
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text("剪贴板导入失败: $e")));
+    }
+  }
+
   Future<void> _switchSplitMode(String newMode) async {
     if (_splitMode == newMode || _fullContent.isEmpty) return;
 
@@ -476,7 +672,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     }
 
     _splitMode = newMode;
-    final res = await BookParser.resliceInIsolate(_fullContent, _rawChapters, _splitMode);
+    final res = await BookParser.resliceInIsolate(_fullContent, _rawChapters, _splitMode, 0);
     final List<TextSliceNode> newNodes = res['nodes'];
     final List<BookChapter> aligned = res['alignedChapters'];
     final int newIndex = BookParser.findIndexByCharOffset(newNodes, currentAnchorOffset);
@@ -517,7 +713,11 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     );
 
     try {
-      final res = await BookParser.openBookInIsolate(path, _splitMode);
+      String? cacheDir;
+      try {
+        cacheDir = (await getTemporaryDirectory()).path;
+      } catch (_) {}
+      final res = await BookParser.openBookInIsolate(path, _splitMode, 0, cacheDir);
       if (mounted && Navigator.canPop(context)) Navigator.pop(context);
 
       final String fp = res['fingerprint'];
@@ -539,6 +739,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
 
       if (!mounted) return;
       setState(() {
+        _isTemporaryClipboardBook = false;
         _currentFingerprint = fp;
         _currentFilePath = path;
         _currentBookName = name;
@@ -548,6 +749,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         _alignedChapters = aligned;
         _nodes = nodes;
         _currentIndex = startIdx;
+        _contextTargetSliceIndex = startIdx;
         _invalidateAudioCache();
         _searchResults.clear();
         _activeSearchQuery = "";
@@ -862,7 +1064,70 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     return Text.rich(TextSpan(style: baseStyle, children: spans));
   }
 
-  // ────────── 容错类型解析工具，确保备份恢复绝不因字段类型偏差丢失数据 ──────────
+  // ────────── 手机端左右边缘手势与 3 步退出状态机 ──────────
+  Future<void> _exitApplication() async {
+    await _saveHistoryToPrefs(immediate: true);
+    await _saveSettings();
+    SystemNavigator.pop();
+  }
+
+  void _handleRightEdgeSwipeAction() {
+    if (!_isTopRoute || _isVoiceDialogOpen) return;
+    _showVoiceManagerDialog();
+  }
+
+  Future<void> _handleLeftEdgeSwipeAction() async {
+    if (!_isTopRoute) return;
+
+    if (_isSearching) {
+      setState(() {
+        _isSearching = false;
+        _activeSearchQuery = "";
+        _searchResults.clear();
+      });
+      return;
+    }
+    if (_isSelectionMode) {
+      setState(() {
+        _isSelectionMode = false;
+        _selectedFingerprints.clear();
+      });
+      return;
+    }
+
+    final drawerCurrentlyOpen = _isDrawerOpen || (_scaffoldKey.currentState?.isDrawerOpen ?? false);
+    if (!drawerCurrentlyOpen) {
+      // 第 1 划：弹出大纲页
+      _lastBackPressTime = 0;
+      setState(() => _sidebarTab = 0);
+      _scaffoldKey.currentState?.openDrawer();
+      return;
+    }
+
+    // 第 2 划（大纲页已展开，保持大纲不关闭并提示退出） & 第 3 划（真正退出）
+    final now = DateTime.now().millisecondsSinceEpoch;
+    if (now - _lastBackPressTime > 2500) {
+      _lastBackPressTime = now;
+      ScaffoldMessenger.of(context).clearSnackBars();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('再划一次退出鱼听书'), duration: Duration(milliseconds: 1800)),
+      );
+      return;
+    }
+
+    await _exitApplication();
+  }
+
+  void _handleNativeEdgeBack(String edge) {
+    if (!mounted || !_isTopRoute) return;
+    if (edge == 'right') {
+      _handleRightEdgeSwipeAction();
+    } else {
+      _handleLeftEdgeSwipeAction();
+    }
+  }
+
+  // ────────── 容错类型解析工具 ──────────
   int _parseInt(dynamic val, int fallback) {
     if (val is int) return val;
     if (val is num) return val.toInt();
@@ -911,7 +1176,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       final file = File('${targetFolder.path}${Platform.pathSeparator}fish_reader_backup_$dateStr.json');
 
       final data = {
-        'version': 8,
+        'version': 9,
         'engineType': _currentEngine,
         'fishApiKey': _apiKey,
         'fishModel': _fishModel,
@@ -929,6 +1194,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         'followAlong': _followAlong,
         'splitMode': _splitMode,
         'font_size_v2': _fontSize,
+        'reading_bg_color_v1': _readingBgColorValue,
+        'reading_highlight_color_v1': _readingHighlightColorValue,
         'log_level': AppLogger.logLevel,
         'lastBookDir': _lastBookDir,
         'lastBackupDir': _lastBackupDir,
@@ -947,7 +1214,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('备份导出成功'),
-            content: Text('全量配置、自定义引擎、网络策略、书架与书签已成功写入：\n\n${file.path}'),
+            content: Text('全量配置、自定义引擎、网络策略、阅读配色、书架与书签已成功写入：\n\n${file.path}'),
             actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('好'))],
           ),
         );
@@ -958,7 +1225,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     }
   }
 
-  // ────────── 完整备份恢复 (全字段兼容性校验 + 立即持久化 + 结果核对) ──────────
+  // ────────── 完整备份恢复 ──────────
   Future<bool> _restoreBackupFromFile(String path) async {
     try {
       await StorageHelper.checkAndRequestManagePermission();
@@ -968,7 +1235,6 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         return false;
       }
 
-      // 避免 Android FilePicker 返回的缓存路径污染真实备份目录
       final parentPath = file.parent.path;
       if (!parentPath.contains('/cache/') && !parentPath.contains('file_picker')) {
         _lastBackupDir = parentPath;
@@ -981,10 +1247,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         return false;
       }
       final data = Map<String, dynamic>.from(decoded);
-
       final String prevSplitMode = _splitMode;
 
-      // 1. 先恢复音色字典与自定义引擎，确保后续校验当前选中引擎与音色不被回退覆盖
       final restoredFishVoices = _parseStringMap(data['fishVoices'] ?? data['custom_user_fish_voices']);
       final restoredMsVoices = _parseStringMap(data['msVoices'] ?? data['custom_user_ms_voices']);
 
@@ -998,7 +1262,6 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         }
       }
 
-      // 2. 恢复其它核心标量参数（支持别名兼容）
       final String restoredEngine = (data['engineType'] ?? _currentEngine).toString();
       final String restoredApiKey = (data['fishApiKey'] ?? data['apiKey'] ?? data['fish_api_key'] ?? _apiKey).toString().trim();
       final String rawFishModel = (data['fishModel'] ?? _fishModel).toString();
@@ -1015,9 +1278,10 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       final bool restoredFollow = _parseBool(data['followAlong'], _followAlong);
       final String restoredSplit = (data['splitMode'] ?? _splitMode).toString() == 'paragraph' ? 'paragraph' : 'sentence';
       final double restoredFont = _parseDouble(data['font_size_v2'] ?? data['font_size'] ?? data['fontSize'], _fontSize).clamp(10.0, 20.0);
+      final int restoredBgColor = _parseInt(data['reading_bg_color_v1'], _readingBgColorValue);
+      final int restoredHlColor = _parseInt(data['reading_highlight_color_v1'], _readingHighlightColorValue);
       final String restoredLogLevel = AppLogger.normalizeLevel((data['log_level'] ?? data['logLevel'])?.toString());
 
-      // 3. 恢复网络策略 (兼容新版分引擎 3 态 & 旧版全局代理配置)
       final Map<String, String> restoredRoutes = {'ms': 'direct', 'fish': 'direct'};
       final Map<String, String> restoredProxies = {};
 
@@ -1027,7 +1291,6 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
           restoredRoutes[k.toString()] = normalizeEngineNetworkMode(v?.toString());
         });
       } else if (data.containsKey('proxyMode')) {
-        // 迁移老版本全局 proxyMode
         final oldMode = data['proxyMode']?.toString();
         final oldCustom = normalizeProxyInput(data['customProxy']?.toString() ?? '');
         if (oldMode == 'manual' && oldCustom.isNotEmpty) {
@@ -1049,7 +1312,6 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         });
       }
 
-      // 4. 恢复路径、书签与书架历史
       final String restoredBookDir = (data['lastBookDir'] ?? _lastBookDir).toString();
       final String restoredBackupDir = (data['lastBackupDir'] ?? _lastBackupDir).toString();
       final String restoredMp3Dir = (data['lastMp3Dir'] ?? _lastMp3Dir).toString();
@@ -1074,7 +1336,6 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         });
       }
 
-      // 5. 统一写入状态并同步所有底层对象
       setState(() {
         if (restoredFishVoices.isNotEmpty) _userFishVoices = restoredFishVoices;
         if (restoredMsVoices.isNotEmpty) _userMsVoices = restoredMsVoices;
@@ -1096,6 +1357,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         _followAlong = restoredFollow;
         _splitMode = restoredSplit;
         _fontSize = restoredFont;
+        _readingBgColorValue = restoredBgColor;
+        _readingHighlightColorValue = restoredHlColor;
         AppLogger.logLevel = restoredLogLevel;
 
         if (restoredBookDir.isNotEmpty) _lastBookDir = restoredBookDir;
@@ -1123,10 +1386,9 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       await _saveSettings();
       await _saveHistoryToPrefs(immediate: true);
 
-      // 若当前已打开书籍且断句模式被备份改变，重新切片定位
       if (_fullContent.isNotEmpty && prevSplitMode != _splitMode) {
         final targetOffset = (_nodes.isNotEmpty && _currentIndex < _nodes.length) ? _nodes[_currentIndex].startOffset : 0;
-        final res = await BookParser.resliceInIsolate(_fullContent, _rawChapters, _splitMode);
+        final res = await BookParser.resliceInIsolate(_fullContent, _rawChapters, _splitMode, 0);
         if (mounted) {
           setState(() {
             _nodes = res['nodes'];
@@ -1138,7 +1400,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       }
 
       AppLogger.log(
-        "备份恢复完成 [引擎:$_currentEngine, APIKey:${_apiKey.isEmpty ? '空' : '已恢复(${_apiKey.length}位)'}, 预读:$_preloadCount句, 字体:${_fontSize}px, 书架:${_history.length}本, 自定义引擎:${_customEngines.length}个, 日志:$AppLogger.logLevel]",
+        "备份恢复完成 [引擎:$_currentEngine, APIKey:${_apiKey.isEmpty ? '空' : '已恢复(${_apiKey.length}位)'}, 预读:$_preloadCount句, 字体:${_fontSize}px, 书架:${_history.length}本, 自定义引擎:${_customEngines.length}个, 日志:${AppLogger.logLevel}]",
         null,
         null,
         true,
@@ -1163,8 +1425,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
               '• 当前引擎：${ReaderDialogs.getEngineDisplayName(_currentEngine, _customEngines)}\n'
               '• Fish API Key：$maskedKey\n'
               '• 预读缓存：$_preloadCount 句 | 导出线程：$_exportThreads\n'
-              '• 正文字号：${_fontSize.toStringAsFixed(1).replaceAll(".0", "")} px | 日志层级：${AppLogger.logLevel}\n'
-              '• 自定义引擎：${_customEngines.length} 个\n'
+              '• 正文字号：${_fontSize.toStringAsFixed(1).replaceAll(".0", "")} px | 背景：${colorToHex(Color(_readingBgColorValue))}\n'
+              '• 自定义引擎：${_customEngines.length} 个 | 日志层级：${AppLogger.logLevel}\n'
               '• 书架记录：${_history.length} 本 | 书签：${_bookmarks.length} 条',
               style: const TextStyle(height: 1.5, fontSize: 13),
             ),
@@ -1227,6 +1489,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       followAlong: _followAlong,
       splitMode: _splitMode,
       fontSize: _fontSize,
+      readingBgColor: _readingBgColorValue,
+      readingHighlightColor: _readingHighlightColorValue,
       logLevel: AppLogger.logLevel,
       lastBackupDir: _lastBackupDir,
       onExportBackup: _exportBackup,
@@ -1255,6 +1519,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         required followAlong,
         required splitMode,
         required fontSize,
+        required readingBgColor,
+        required readingHighlightColor,
         required logLevel,
       }) async {
         final bool splitChanged = (_splitMode != splitMode);
@@ -1287,13 +1553,15 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
 
           _followAlong = followAlong;
           _fontSize = fontSize.clamp(10.0, 20.0);
+          _readingBgColorValue = readingBgColor;
+          _readingHighlightColorValue = readingHighlightColor;
           _ensureValidSelectedEngineAndVoice();
           if (audioParamsChanged) _invalidateAudioCache();
         });
 
         await _networkRouter.refreshSystemProxy();
         await _saveSettings();
-        AppLogger.log("系统设置已保存 [引擎:$_currentEngine, 预读:$_preloadCount, 字号:${_fontSize}px, 日志:${AppLogger.logLevel}]", null, null, true);
+        AppLogger.log("系统设置已保存 [引擎:$_currentEngine, 预读:$_preloadCount, 字号:${_fontSize}px, 背景:${colorToHex(Color(_readingBgColorValue))}, 日志:${AppLogger.logLevel}]", null, null, true);
 
         if (splitChanged) {
           await _switchSplitMode(splitMode);
@@ -1305,6 +1573,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   }
 
   void _showVoiceManagerDialog() {
+    if (_isVoiceDialogOpen) return;
+    _isVoiceDialogOpen = true;
     ReaderDialogs.showVoiceManagerDialog(
       context: context,
       currentEngine: _currentEngine,
@@ -1359,6 +1629,9 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
         _saveSettings();
       },
       onPinToggled: () => _saveSettings(),
+      onClosed: () {
+        _isVoiceDialogOpen = false;
+      },
     );
   }
 
@@ -1403,6 +1676,12 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
   }
 
   void _openExportDialog() {
+    if (_nodes.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("请先打开电子书或从剪贴板导入文本后再导出 MP3")),
+      );
+      return;
+    }
     ReaderDialogs.openExportDialog(
       hostContext: context,
       exportController: _exportController,
@@ -1437,11 +1716,16 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
     final route = _networkRouter.getEngineRoute(engId, _customEngines);
     if (route == 'system') {
       final sys = _networkRouter.detectedSystemProxy;
-      return sys != null && sys.isNotEmpty ? '系统代理($sys)' : '系统代理(未检测到-回退直连)';
+      if (sys != null && sys.isNotEmpty) return '系统代理($sys)';
+      if (Platform.isAndroid && _networkRouter.hasActiveVpn) return '系统VPN隧道(Exclave等)';
+      return '系统代理(未检测到-回退直连)';
     }
     if (route == 'custom') {
       final custom = _networkRouter.getEngineCustomProxy(engId, _customEngines);
       return custom.isNotEmpty ? '自定义代理($custom)' : '自定义代理(未填写-回退直连)';
+    }
+    if (Platform.isAndroid && _networkRouter.hasActiveVpn) {
+      return _networkRouter.hasBypassPhysicalNetwork ? '物理网卡直连(已绕过VPN)' : '直连(未检测到可绕过物理网卡)';
     }
     return '直连';
   }
@@ -1468,6 +1752,16 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(8),
+                margin: const EdgeInsets.only(bottom: 10),
+                decoration: BoxDecoration(color: const Color(0xFFEFE7D2), borderRadius: BorderRadius.circular(6)),
+                child: Text(
+                  _networkRouter.describeNetworkBanner(),
+                  style: const TextStyle(fontSize: 11.5, color: Color(0xFF743C00)),
+                ),
+              ),
               Text("微软官方 [${_describeEngineRoute('ms')}]: ${msRes['success'] ? '✅ 畅通' : '❌ 异常'} (${msRes['latency']}ms)"),
               Text("详情: ${msRes['msg']}", style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
               const Divider(),
@@ -1488,10 +1782,18 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
 
   @override
   Widget build(BuildContext context) {
-    final bool isWide = MediaQuery.of(context).size.width >= 750;
-    final String bookTitle = _currentBookName ?? "微信读书纯享版";
+    final media = MediaQuery.of(context);
+    final bool isWide = media.size.width >= 750;
+    final double screenW = media.size.width;
+    final String bookTitle = _currentBookName ?? "鱼听书";
     final String chapSubTitle = _currentChapterTitle();
     final bookList = _history.values.toList()..sort((a, b) => b.lastReadTime.compareTo(a.lastReadTime));
+
+    final Color readingBg = Color(_readingBgColorValue);
+    final Color readingHlBg = Color(_readingHighlightColorValue);
+    final Color normalTextColor = getContrastTextColor(readingBg);
+    final Color hlTextColor = getHighlightTextColor(readingHlBg);
+    final Color hlAccentColor = getHighlightAccentColor(readingHlBg);
 
     final String currentVoiceName = _voicesForEngine(_currentEngine)[_selectedVoiceId] ?? _selectedVoiceId;
     final String currentEngineLabel = _currentEngine == 'ms'
@@ -1503,39 +1805,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
       canPop: false,
       onPopInvokedWithResult: (didPop, result) async {
         if (didPop) return;
-
-        if (_isSearching) {
-          setState(() {
-            _isSearching = false;
-            _activeSearchQuery = "";
-            _searchResults.clear();
-          });
-          return;
-        }
-        if (_scaffoldKey.currentState?.isDrawerOpen == true) {
-          Navigator.pop(context);
-          return;
-        }
-        if (_isSelectionMode) {
-          setState(() {
-            _isSelectionMode = false;
-            _selectedFingerprints.clear();
-          });
-          return;
-        }
-
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - _lastBackPressTime > 2000) {
-          _lastBackPressTime = now;
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('再按一次返回退出鱼听书'), duration: Duration(milliseconds: 1500)),
-          );
-          return;
-        }
-
-        await _saveHistoryToPrefs(immediate: true);
-        await _saveSettings();
-        SystemNavigator.pop();
+        await _handleLeftEdgeSwipeAction();
       },
       child: Focus(
         focusNode: _keyboardFocusNode,
@@ -1569,95 +1839,133 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
           },
           child: Scaffold(
             key: _scaffoldKey,
+            backgroundColor: readingBg,
             drawerEnableOpenDragGesture: true,
-            drawerEdgeDragWidth: 42.0,
-            drawer: Drawer(
-              child: ReaderSidebar(
-                sidebarTab: _sidebarTab,
-                isSelectionMode: _isSelectionMode,
-                selectedFingerprints: _selectedFingerprints,
-                chapters: _alignedChapters,
-                currentIndex: _currentIndex,
-                bookList: bookList,
-                bookmarks: _currentBookBookmarks,
-                onTabChanged: (t) => setState(() {
-                  _sidebarTab = t;
-                  if (t == 0) {
-                    _isSelectionMode = false;
-                    _selectedFingerprints.clear();
+            drawerEdgeDragWidth: 32.0,
+            onDrawerChanged: (isOpened) {
+              _isDrawerOpen = isOpened;
+              if (isOpened) {
+                // 打开抽屉时归零返回退出计数
+                _lastBackPressTime = 0;
+              } else {
+                _lastBackPressTime = 0;
+              }
+            },
+            drawer: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onHorizontalDragStart: (d) {
+                if (d.globalPosition.dx <= 36) {
+                  _edgeDragStartX = d.globalPosition.dx;
+                  _edgeDragAccumDx = 0;
+                  _edgeDragHandled = false;
+                } else {
+                  _edgeDragStartX = null;
+                }
+              },
+              onHorizontalDragUpdate: (d) {
+                if (_edgeDragStartX != null && !_edgeDragHandled) {
+                  _edgeDragAccumDx += d.delta.dx;
+                  if (_edgeDragAccumDx > 36) {
+                    _edgeDragHandled = true;
+                    _handleLeftEdgeSwipeAction();
                   }
-                }),
-                onToggleSelectionMode: () => setState(() {
-                  _isSelectionMode = !_isSelectionMode;
-                  _selectedFingerprints.clear();
-                }),
-                onChapterSelected: (pIdx) {
-                  setState(() => _currentIndex = pIdx);
-                  _saveHistoryToPrefs();
-                  _scrollToCurrentCenter(force: true);
-                  if (_isPlaying) _startTTS();
-                },
-                onBookSelected: (item) => _openBook(item.lastKnownPath),
-                onBookRelink: (item) async {
-                  String? newPath;
-                  if (Platform.isAndroid) {
-                    newPath = await StorageHelper.browseSharedStorage(context, chooseDirectory: false, extensions: ['txt', 'epub', 'md', 'markdown'], initialPath: _lastBookDir);
-                  } else {
-                    final res = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['txt', 'epub', 'md']);
-                    newPath = res?.files.single.path;
-                  }
-                  if (newPath != null) _openBook(newPath);
-                },
-                onToggleBookSelection: (fp, selected) => setState(() {
-                  if (selected) {
-                    _selectedFingerprints.add(fp);
-                  } else {
-                    _selectedFingerprints.remove(fp);
-                  }
-                }),
-                onSelectAllToggle: () => setState(() {
-                  if (_selectedFingerprints.length == bookList.length) {
-                    _selectedFingerprints.clear();
-                  } else {
-                    _selectedFingerprints.addAll(bookList.map((e) => e.fingerprint));
-                  }
-                }),
-                onDeleteSelected: () {
-                  setState(() {
-                    for (var fp in _selectedFingerprints) {
-                      _history.remove(fp);
+                }
+              },
+              onHorizontalDragEnd: (_) => _edgeDragStartX = null,
+              child: Drawer(
+                child: ReaderSidebar(
+                  sidebarTab: _sidebarTab,
+                  isSelectionMode: _isSelectionMode,
+                  selectedFingerprints: _selectedFingerprints,
+                  chapters: _alignedChapters,
+                  currentIndex: _currentIndex,
+                  bookList: bookList,
+                  bookmarks: _currentBookBookmarks,
+                  onTabChanged: (t) => setState(() {
+                    _sidebarTab = t;
+                    if (t == 0) {
+                      _isSelectionMode = false;
+                      _selectedFingerprints.clear();
                     }
-                    _isSelectionMode = false;
+                  }),
+                  onToggleSelectionMode: () => setState(() {
+                    _isSelectionMode = !_isSelectionMode;
                     _selectedFingerprints.clear();
-                  });
-                  _saveHistoryToPrefs(immediate: true);
-                },
-                onBookmarkSelected: (bm) {
-                  setState(() => _currentIndex = bm.paragraphIndex);
-                  _scrollToCurrentCenter(force: true);
-                },
-                onBookmarkEdit: (bm) {
-                  ReaderDialogs.showEditBookmarkDialog(
-                    context: context,
-                    bookmark: bm,
-                    onSave: (newContent, newNote) {
-                      setState(() {
-                        bm.content = newContent;
-                        bm.note = newNote;
-                      });
-                      _saveSettings();
-                    },
-                  );
-                },
-                onBookmarkDelete: (bm) {
-                  setState(() => _bookmarks.removeWhere((b) => b.id == bm.id));
-                  _saveSettings();
-                  ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("书签已移除")));
-                },
+                  }),
+                  onChapterSelected: (pIdx) {
+                    setState(() => _currentIndex = pIdx);
+                    _saveHistoryToPrefs();
+                    _scrollToCurrentCenter(force: true);
+                    if (_isPlaying) _startTTS();
+                  },
+                  onBookSelected: (item) => _openBook(item.lastKnownPath),
+                  onBookRelink: (item) async {
+                    String? newPath;
+                    if (Platform.isAndroid) {
+                      newPath = await StorageHelper.browseSharedStorage(context, chooseDirectory: false, extensions: ['txt', 'epub', 'md', 'markdown'], initialPath: _lastBookDir);
+                    } else {
+                      final res = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['txt', 'epub', 'md']);
+                      newPath = res?.files.single.path;
+                    }
+                    if (newPath != null) _openBook(newPath);
+                  },
+                  onToggleBookSelection: (fp, selected) => setState(() {
+                    if (selected) {
+                      _selectedFingerprints.add(fp);
+                    } else {
+                      _selectedFingerprints.remove(fp);
+                    }
+                  }),
+                  onSelectAllToggle: () => setState(() {
+                    if (_selectedFingerprints.length == bookList.length) {
+                      _selectedFingerprints.clear();
+                    } else {
+                      _selectedFingerprints.addAll(bookList.map((e) => e.fingerprint));
+                    }
+                  }),
+                  onDeleteSelected: () {
+                    setState(() {
+                      for (var fp in _selectedFingerprints) {
+                        _history.remove(fp);
+                      }
+                      _isSelectionMode = false;
+                      _selectedFingerprints.clear();
+                    });
+                    _saveHistoryToPrefs(immediate: true);
+                  },
+                  onBookmarkSelected: (bm) {
+                    setState(() => _currentIndex = bm.paragraphIndex);
+                    _scrollToCurrentCenter(force: true);
+                  },
+                  onBookmarkEdit: (bm) {
+                    ReaderDialogs.showEditBookmarkDialog(
+                      context: context,
+                      bookmark: bm,
+                      onSave: (newContent, newNote) {
+                        setState(() {
+                          bm.content = newContent;
+                          bm.note = newNote;
+                        });
+                        _saveSettings();
+                      },
+                    );
+                  },
+                  onBookmarkDelete: (bm) {
+                    setState(() => _bookmarks.removeWhere((b) => b.id == bm.id));
+                    _saveSettings();
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text("书签已移除")));
+                  },
+                ),
               ),
             ),
             appBar: AppBar(
-              leading: IconButton(icon: const Icon(Icons.menu), onPressed: () => _scaffoldKey.currentState?.openDrawer()),
+              leading: IconButton(
+                icon: const Icon(Icons.menu),
+                onPressed: () {
+                  setState(() => _sidebarTab = 0);
+                  _scaffoldKey.currentState?.openDrawer();
+                },
+              ),
               title: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
@@ -1687,12 +1995,8 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
                       case "custom_engines":
                         await _openCustomEnginesManager();
                         break;
-                      case "restore":
-                        await ReaderDialogs.showRestorePicker(
-                          context: context,
-                          lastBackupDir: _lastBackupDir,
-                          onRestoreFile: _restoreBackupFromFile,
-                        );
+                      case "export_mp3":
+                        _openExportDialog();
                         break;
                       case "network":
                         await _runConnectivityDiagnostics();
@@ -1705,133 +2009,220 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
                           },
                         );
                         break;
+                      case "clipboard_import":
+                        await _importFromClipboard();
+                        break;
                     }
                   },
-                  itemBuilder: (_) => [
-                    const PopupMenuItem(value: "settings", child: Row(children: [Icon(Icons.settings, color: Colors.blue), SizedBox(width: 8), Text("系统、字体与网络设置")])),
-                    const PopupMenuItem(value: "custom_engines", child: Row(children: [Icon(Icons.extension, color: Color(0xFFC87D2E)), SizedBox(width: 8), Text("自定义 TTS 引擎管理")])),
-                    const PopupMenuItem(value: "restore", child: Row(children: [Icon(Icons.settings_backup_restore, color: Colors.deepOrange), SizedBox(width: 8), Text("从备份文件恢复")])),
-                    const PopupMenuItem(value: "network", child: Row(children: [Icon(Icons.wifi_find, color: Colors.teal), SizedBox(width: 8), Text("全引擎连通性诊断")])),
-                    const PopupMenuItem(value: "logs", child: Row(children: [Icon(Icons.terminal, color: Color(0xFFC87D2E)), SizedBox(width: 8), Text("运行日志管理")])),
+                  itemBuilder: (_) => const [
+                    PopupMenuItem(value: "settings", child: Row(children: [Icon(Icons.settings, color: Colors.blue), SizedBox(width: 8), Text("系统设置")])),
+                    PopupMenuItem(value: "custom_engines", child: Row(children: [Icon(Icons.extension, color: Color(0xFFC87D2E)), SizedBox(width: 8), Text("TTS引擎管理")])),
+                    PopupMenuItem(value: "export_mp3", child: Row(children: [Icon(Icons.audio_file_outlined, color: Colors.deepOrange), SizedBox(width: 8), Text("合成导出MP3")])),
+                    PopupMenuItem(value: "network", child: Row(children: [Icon(Icons.wifi_find, color: Colors.teal), SizedBox(width: 8), Text("TTS引擎连通测试")])),
+                    PopupMenuItem(value: "logs", child: Row(children: [Icon(Icons.terminal, color: Color(0xFFC87D2E)), SizedBox(width: 8), Text("运行日志管理")])),
+                    PopupMenuItem(value: "clipboard_import", child: Row(children: [Icon(Icons.content_paste_go, color: Colors.indigo), SizedBox(width: 8), Text("剪贴板导入")])),
                   ],
                 ),
               ],
             ),
             body: Stack(
               children: [
-                _nodes.isEmpty
-                    ? EmptyBookshelfView(
-                        bookList: bookList,
-                        onImportFile: _importFile,
-                        onOpenBook: _openBook,
-                        onRelinkBook: (item) async {
-                          String? newPath;
-                          if (Platform.isAndroid) {
-                            newPath = await StorageHelper.browseSharedStorage(context, chooseDirectory: false, extensions: ['txt', 'epub', 'md', 'markdown'], initialPath: _lastBookDir);
-                          } else {
-                            final res = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['txt', 'epub', 'md']);
-                            newPath = res?.files.single.path;
-                          }
-                          if (newPath != null) _openBook(newPath);
-                        },
-                      )
-                    : SelectionArea(
-                        contextMenuBuilder: (context, selectableRegionState) => AdaptiveTextSelectionToolbar.buttonItems(
-                          anchors: selectableRegionState.contextMenuAnchors,
-                          buttonItems: [
-                            ...selectableRegionState.contextMenuButtonItems,
-                            ContextMenuButtonItem(
-                              label: '🔖 在此添加书签',
-                              onPressed: () {
-                                selectableRegionState.hideToolbar();
-                                _addBookmarkAt(_currentIndex);
-                              },
-                            ),
-                            ContextMenuButtonItem(
-                              label: '🎯 视线对齐当前项',
-                              onPressed: () {
-                                selectableRegionState.hideToolbar();
-                                _scrollToCurrentCenter(force: true);
-                              },
-                            ),
-                            ContextMenuButtonItem(
-                              label: '⏮️ 上一章',
-                              onPressed: () {
-                                selectableRegionState.hideToolbar();
-                                for (int i = _alignedChapters.length - 1; i >= 0; i--) {
-                                  if (_alignedChapters[i].paragraphIndex < _currentIndex - 1) {
-                                    setState(() => _currentIndex = _alignedChapters[i].paragraphIndex);
-                                    _saveHistoryToPrefs();
-                                    _scrollToCurrentCenter(force: true);
-                                    if (_isPlaying) _startTTS();
-                                    return;
-                                  }
-                                }
-                              },
-                            ),
-                            ContextMenuButtonItem(
-                              label: '⏭️ 下一章',
-                              onPressed: () {
-                                selectableRegionState.hideToolbar();
-                                for (int i = 0; i < _alignedChapters.length; i++) {
-                                  if (_alignedChapters[i].paragraphIndex > _currentIndex) {
-                                    setState(() => _currentIndex = _alignedChapters[i].paragraphIndex);
-                                    _saveHistoryToPrefs();
-                                    _scrollToCurrentCenter(force: true);
-                                    if (_isPlaying) _startTTS();
-                                    return;
-                                  }
-                                }
-                              },
-                            ),
-                          ],
-                        ),
-                        child: Center(
-                          child: ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 820),
-                            child: ScrollablePositionedList.builder(
-                              itemCount: _nodes.length,
-                              itemScrollController: _itemScrollController,
-                              itemPositionsListener: _itemPositionsListener,
-                              initialScrollIndex: _currentIndex,
-                              initialAlignment: 0.32,
-                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
-                              itemBuilder: (ctx, idx) {
-                                final isCur = idx == _currentIndex;
-                                final isMatch = _searchResults.contains(idx);
-                                final baseStyle = TextStyle(
-                                  fontSize: _fontSize,
-                                  height: 1.88,
-                                  letterSpacing: 0.3,
-                                  fontWeight: isCur ? FontWeight.w600 : FontWeight.normal,
-                                  color: isCur ? const Color(0xFF743C00) : const Color(0xFF2D2E2F),
-                                );
+                Container(
+                  color: readingBg,
+                  child: _nodes.isEmpty
+                      ? EmptyBookshelfView(
+                          bookList: bookList,
+                          readingBgColor: readingBg,
+                          onImportFile: _importFile,
+                          onOpenBook: _openBook,
+                          onRelinkBook: (item) async {
+                            String? newPath;
+                            if (Platform.isAndroid) {
+                              newPath = await StorageHelper.browseSharedStorage(context, chooseDirectory: false, extensions: ['txt', 'epub', 'md', 'markdown'], initialPath: _lastBookDir);
+                            } else {
+                              final res = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['txt', 'epub', 'md']);
+                              newPath = res?.files.single.path;
+                            }
+                            if (newPath != null) _openBook(newPath);
+                          },
+                        )
+                      : SelectionArea(
+                          contextMenuBuilder: (context, selectableRegionState) {
+                            // 严格白名单：仅保留纯本地“复制”与“全选”，彻底屏蔽系统注入的分享、文件传输助手、浏览器搜索等外部项
+                            final allowedSystemItems = selectableRegionState.contextMenuButtonItems
+                                .where((item) => item.type == ContextMenuButtonType.copy || item.type == ContextMenuButtonType.selectAll)
+                                .toList();
 
-                                return GestureDetector(
-                                  onDoubleTap: () {
-                                    setState(() => _currentIndex = idx);
-                                    _saveHistoryToPrefs();
-                                    _startTTS();
+                            return AdaptiveTextSelectionToolbar.buttonItems(
+                              anchors: selectableRegionState.contextMenuAnchors,
+                              buttonItems: [
+                                ...allowedSystemItems,
+                                ContextMenuButtonItem(
+                                  label: '📋 复制本章节',
+                                  onPressed: () {
+                                    selectableRegionState.hideToolbar();
+                                    _copyChapterAt(_contextTargetSliceIndex);
                                   },
-                                  onSecondaryTap: () => _addBookmarkAt(idx),
-                                  onLongPress: () => _addBookmarkAt(idx),
-                                  child: Container(
-                                    width: double.infinity,
-                                    margin: const EdgeInsets.symmetric(vertical: 4),
-                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                    decoration: BoxDecoration(
-                                      color: isCur ? const Color(0xFFEFE7D2) : (isMatch ? Colors.yellow.shade50 : Colors.transparent),
-                                      borderRadius: BorderRadius.circular(6),
-                                      border: isCur ? const Border(left: BorderSide(color: Color(0xFFC87D2E), width: 3.5)) : null,
+                                ),
+                                ContextMenuButtonItem(
+                                  label: '📄 复制全文',
+                                  onPressed: () {
+                                    selectableRegionState.hideToolbar();
+                                    _copyFullText();
+                                  },
+                                ),
+                                ContextMenuButtonItem(
+                                  label: '🔖 在此添加书签',
+                                  onPressed: () {
+                                    selectableRegionState.hideToolbar();
+                                    _addBookmarkAt(_contextTargetSliceIndex);
+                                  },
+                                ),
+                                ContextMenuButtonItem(
+                                  label: '🎯 视线对齐当前项',
+                                  onPressed: () {
+                                    selectableRegionState.hideToolbar();
+                                    _scrollToCurrentCenter(force: true);
+                                  },
+                                ),
+                                ContextMenuButtonItem(
+                                  label: '⏮️ 上一章',
+                                  onPressed: () {
+                                    selectableRegionState.hideToolbar();
+                                    for (int i = _alignedChapters.length - 1; i >= 0; i--) {
+                                      if (_alignedChapters[i].paragraphIndex < _currentIndex - 1) {
+                                        setState(() => _currentIndex = _alignedChapters[i].paragraphIndex);
+                                        _saveHistoryToPrefs();
+                                        _scrollToCurrentCenter(force: true);
+                                        if (_isPlaying) _startTTS();
+                                        return;
+                                      }
+                                    }
+                                  },
+                                ),
+                                ContextMenuButtonItem(
+                                  label: '⏭️ 下一章',
+                                  onPressed: () {
+                                    selectableRegionState.hideToolbar();
+                                    for (int i = 0; i < _alignedChapters.length; i++) {
+                                      if (_alignedChapters[i].paragraphIndex > _currentIndex) {
+                                        setState(() => _currentIndex = _alignedChapters[i].paragraphIndex);
+                                        _saveHistoryToPrefs();
+                                        _scrollToCurrentCenter(force: true);
+                                        if (_isPlaying) _startTTS();
+                                        return;
+                                      }
+                                    }
+                                  },
+                                ),
+                              ],
+                            );
+                          },
+                          child: Center(
+                            child: ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 820),
+                              child: ScrollablePositionedList.builder(
+                                itemCount: _nodes.length,
+                                itemScrollController: _itemScrollController,
+                                itemPositionsListener: _itemPositionsListener,
+                                initialScrollIndex: _currentIndex,
+                                initialAlignment: 0.32,
+                                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+                                itemBuilder: (ctx, idx) {
+                                  final isCur = idx == _currentIndex;
+                                  final isMatch = _searchResults.contains(idx);
+                                  final baseStyle = TextStyle(
+                                    fontSize: _fontSize,
+                                    height: 1.88,
+                                    letterSpacing: 0.3,
+                                    fontWeight: isCur ? FontWeight.w600 : FontWeight.normal,
+                                    color: isCur ? hlTextColor : normalTextColor,
+                                  );
+
+                                  return Listener(
+                                    onPointerDown: (_) => _contextTargetSliceIndex = idx,
+                                    child: GestureDetector(
+                                      onDoubleTap: () {
+                                        setState(() => _currentIndex = idx);
+                                        _saveHistoryToPrefs();
+                                        _startTTS();
+                                      },
+                                      child: Container(
+                                        width: double.infinity,
+                                        margin: const EdgeInsets.symmetric(vertical: 4),
+                                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                        decoration: BoxDecoration(
+                                          color: isCur ? readingHlBg : (isMatch ? Colors.yellow.shade200.withOpacity(0.7) : Colors.transparent),
+                                          borderRadius: BorderRadius.circular(6),
+                                          border: isCur ? Border(left: BorderSide(color: hlAccentColor, width: 3.5)) : null,
+                                        ),
+                                        child: _buildHighlightedParagraph(_nodes[idx].text, baseStyle),
+                                      ),
                                     ),
-                                    child: _buildHighlightedParagraph(_nodes[idx].text, baseStyle),
-                                  ),
-                                );
-                              },
+                                  );
+                                },
+                              ),
                             ),
                           ),
                         ),
-                      ),
+                ),
+
+                // 手机端左边缘向内划热区：第 1 划确保切换到大纲目录弹出
+                Positioned(
+                  left: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: 24,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onHorizontalDragStart: (d) {
+                      _edgeDragStartX = d.globalPosition.dx;
+                      _edgeDragAccumDx = 0;
+                      _edgeDragHandled = false;
+                    },
+                    onHorizontalDragUpdate: (d) {
+                      if (_edgeDragStartX != null && !_edgeDragHandled) {
+                        _edgeDragAccumDx += d.delta.dx;
+                        if (_edgeDragAccumDx > 24) {
+                          _edgeDragHandled = true;
+                          _handleLeftEdgeSwipeAction();
+                        }
+                      }
+                    },
+                    onHorizontalDragEnd: (_) => _edgeDragStartX = null,
+                  ),
+                ),
+
+                // 手机端右边缘向内划热区：弹出发音人管理区，不触发退出
+                Positioned(
+                  right: 0,
+                  top: 0,
+                  bottom: 0,
+                  width: 24,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.translucent,
+                    onHorizontalDragStart: (d) {
+                      if (d.globalPosition.dx >= screenW - 36) {
+                        _edgeDragStartX = d.globalPosition.dx;
+                        _edgeDragAccumDx = 0;
+                        _edgeDragHandled = false;
+                      } else {
+                        _edgeDragStartX = null;
+                      }
+                    },
+                    onHorizontalDragUpdate: (d) {
+                      if (_edgeDragStartX != null && !_edgeDragHandled) {
+                        _edgeDragAccumDx += d.delta.dx;
+                        if (_edgeDragAccumDx < -24) {
+                          _edgeDragHandled = true;
+                          _handleRightEdgeSwipeAction();
+                        }
+                      }
+                    },
+                    onHorizontalDragEnd: (_) => _edgeDragStartX = null,
+                  ),
+                ),
+
                 if (_isSearching)
                   Positioned(
                     top: 10,
@@ -1841,7 +2232,7 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
                       borderRadius: BorderRadius.circular(22),
                       color: const Color(0xFFFCFBF7),
                       child: Container(
-                        width: min(360.0, MediaQuery.of(context).size.width - 32),
+                        width: min(360.0, screenW - 32),
                         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
                         decoration: BoxDecoration(
                           borderRadius: BorderRadius.circular(22),
@@ -1965,7 +2356,10 @@ class _ReaderHomeScreenState extends State<ReaderHomeScreen> with WidgetsBinding
                 _scrollToCurrentCenter(force: true);
                 if (_isPlaying) _startTTS();
               },
-              onOpenDrawer: () => _scaffoldKey.currentState?.openDrawer(),
+              onOpenDrawer: () {
+                setState(() => _sidebarTab = 0);
+                _scaffoldKey.currentState?.openDrawer();
+              },
               onPrev: () => _jumpSentence(-1),
               onPlayPause: _togglePlayPause,
               onNext: () => _jumpSentence(1),
