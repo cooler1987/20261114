@@ -4,25 +4,98 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 
 import 'models.dart';
 import 'system_utils.dart';
 
+// ────────────────── Android 物理网卡直连 Client (绕过 VPN / Exclave TUN) ──────────────────
+class _AndroidDirectBypassClient extends http.BaseClient {
+  final int timeoutMs;
+  _AndroidDirectBypassClient({this.timeoutMs = 90000});
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    final byteStream = request.finalize();
+    final bytes = await byteStream.toBytes();
+    try {
+      final res = await AndroidNativeBridge.nativeHttpRequest(
+        method: request.method,
+        url: request.url.toString(),
+        headers: request.headers,
+        bodyBytes: bytes.isEmpty ? null : bytes,
+        timeoutMs: timeoutMs,
+        bypassVpn: true,
+      );
+      return http.StreamedResponse(
+        Stream.value(res.bodyBytes),
+        res.statusCode,
+        headers: res.headers,
+        request: request,
+      );
+    } on PlatformException catch (e) {
+      if (e.code == 'VPN_BYPASS_BLOCKED') {
+        throw Exception('直连绕过 VPN 被系统拦截：请在 Exclave 设置中开启「允许应用绕过 VPN」或将本应用设为分应用绕过 (${e.message})');
+      }
+      throw Exception('物理直连请求失败 (${e.code}): ${e.message}');
+    }
+  }
+}
+
 // ────────────────── 分引擎连接池与 3 态网络路由器 (直连 / 系统代理 / 自定义代理端口) ──────────────────
 class TtsNetworkRouter {
   String? detectedSystemProxy;
+  bool hasActiveVpn = false;
+  bool hasBypassPhysicalNetwork = false;
+  String networkSummary = '';
+
   Map<String, String> engineNetworkModes = {'ms': 'direct', 'fish': 'direct'};
   Map<String, String> engineCustomProxies = {};
 
   IOClient? _directClient;
+  IOClient? _systemDefaultClient;
+  _AndroidDirectBypassClient? _androidBypassClient;
   final Map<String, IOClient> _proxyClients = {};
 
   Future<String?> refreshSystemProxy() async {
-    detectedSystemProxy = await detectSystemProxy();
-    AppLogger.log("系统代理探测完成: ${detectedSystemProxy ?? '未检测到系统代理'}", null, null, true);
+    if (Platform.isAndroid) {
+      final state = await AndroidNativeBridge.getNetworkState();
+      hasActiveVpn = state.hasVpn;
+      hasBypassPhysicalNetwork = state.hasBypassNetwork;
+      networkSummary = state.summary;
+      if (state.systemProxy != null && state.systemProxy!.isNotEmpty) {
+        detectedSystemProxy = state.systemProxy;
+      } else {
+        detectedSystemProxy = await detectSystemProxy();
+      }
+    } else {
+      hasActiveVpn = false;
+      hasBypassPhysicalNetwork = true;
+      detectedSystemProxy = await detectSystemProxy();
+      networkSummary = detectedSystemProxy != null ? '系统 HTTP 代理 ($detectedSystemProxy)' : '直连网络';
+    }
+
+    AppLogger.log(
+      "网络环境探测完成 [系统代理: ${detectedSystemProxy ?? '无'}, VPN接管: $hasActiveVpn, 可绕过物理网: $hasBypassPhysicalNetwork, 详情: $networkSummary]",
+      null,
+      null,
+      true,
+    );
     return detectedSystemProxy;
+  }
+
+  String describeNetworkBanner() {
+    if (Platform.isAndroid && hasActiveVpn) {
+      final proxyTip = detectedSystemProxy != null ? ' | HTTP代理: $detectedSystemProxy' : '';
+      final bypassTip = hasBypassPhysicalNetwork ? '直连引擎将绑定物理网卡绕过VPN' : '未检测到独立物理网卡';
+      return '检测到活动 VPN ($networkSummary$proxyTip) · $bypassTip';
+    }
+    if (detectedSystemProxy != null && detectedSystemProxy!.isNotEmpty) {
+      return '系统代理探测结果：$detectedSystemProxy';
+    }
+    return '未检测到系统代理 (直连或手动填端口可用)';
   }
 
   String getEngineRoute(String engineId, [List<CustomTtsEngineConfig>? customEngines]) {
@@ -70,11 +143,25 @@ class TtsNetworkRouter {
       if (detectedSystemProxy != null && detectedSystemProxy!.isNotEmpty) {
         return _getOrCreateProxyClient(detectedSystemProxy!);
       }
+      // Android 开启 VPN (如 Exclave TUN 模式且未暴露 HTTP 代理端口) 时，系统路由走 OS 默认 Socket 即进入 VPN 隧道
+      _systemDefaultClient ??= IOClient(
+        HttpClient()
+          ..findProxy = ((_) => "DIRECT")
+          ..connectionTimeout = const Duration(seconds: 15)
+          ..idleTimeout = const Duration(seconds: 30),
+      );
+      return _systemDefaultClient!;
     } else if (route == 'custom') {
       final customAddr = getEngineCustomProxy(engineId, customEngines);
       if (customAddr.isNotEmpty) {
         return _getOrCreateProxyClient(customAddr);
       }
+    }
+
+    // route == 'direct'：Android 处于活动 VPN 且存在底层物理网卡时，强制走物理网卡绕过 TUN
+    if (Platform.isAndroid && hasActiveVpn && hasBypassPhysicalNetwork) {
+      _androidBypassClient ??= _AndroidDirectBypassClient();
+      return _androidBypassClient!;
     }
 
     _directClient ??= IOClient(
@@ -89,6 +176,10 @@ class TtsNetworkRouter {
   void dispose() {
     _directClient?.close();
     _directClient = null;
+    _systemDefaultClient?.close();
+    _systemDefaultClient = null;
+    _androidBypassClient?.close();
+    _androidBypassClient = null;
     for (final c in _proxyClients.values) {
       c.close();
     }
