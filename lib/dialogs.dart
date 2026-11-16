@@ -218,7 +218,7 @@ class ExportController extends ChangeNotifier {
   }
 }
 
-// ────────────────── 全屏自适应系统设置页 (移动端不局促 + 分引擎3态网络) ──────────────────
+// ────────────────── 全屏自适应系统设置页 (移动端不局促 + 分引擎3态网络 + 自由阅读调色) ──────────────────
 class ReaderSettingsPage extends StatefulWidget {
   final String currentEngine;
   final String apiKey;
@@ -234,6 +234,8 @@ class ReaderSettingsPage extends StatefulWidget {
   final bool followAlong;
   final String splitMode;
   final double fontSize;
+  final int readingBgColorValue;
+  final int readingHighlightColorValue;
   final String logLevel;
   final String lastBackupDir;
 
@@ -256,6 +258,8 @@ class ReaderSettingsPage extends StatefulWidget {
     required bool followAlong,
     required String splitMode,
     required double fontSize,
+    required int readingBgColorValue,
+    required int readingHighlightColorValue,
     required String logLevel,
   }) onSave;
 
@@ -275,6 +279,8 @@ class ReaderSettingsPage extends StatefulWidget {
     required this.followAlong,
     required this.splitMode,
     required this.fontSize,
+    required this.readingBgColorValue,
+    required this.readingHighlightColorValue,
     required this.logLevel,
     required this.lastBackupDir,
     required this.onExportBackup,
@@ -290,6 +296,9 @@ class ReaderSettingsPage extends StatefulWidget {
 
 class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
   late TextEditingController _keyCtrl;
+  late TextEditingController _bgHexCtrl;
+  late TextEditingController _hlHexCtrl;
+
   late String _tempEngine;
   late String _tempFishModel;
   late int _tempBitrate;
@@ -301,6 +310,8 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
   late bool _tempAutoScroll;
   late String _tempSplit;
   late double _tempFontSize;
+  late Color _tempReadingBgColor;
+  late Color _tempReadingHighlightColor;
   late String _tempLogLevel;
   late String _tempBackupDir;
 
@@ -308,6 +319,8 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
   final Map<String, TextEditingController> _customProxyCtrls = {};
   bool _probingProxy = false;
   bool _showFishConfigAlways = false;
+  bool _expandBgRgb = false;
+  bool _expandHlRgb = false;
 
   @override
   void initState() {
@@ -324,6 +337,10 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
     _tempAutoScroll = widget.followAlong;
     _tempSplit = widget.splitMode;
     _tempFontSize = widget.fontSize.clamp(10.0, 20.0);
+    _tempReadingBgColor = Color(widget.readingBgColorValue);
+    _tempReadingHighlightColor = Color(widget.readingHighlightColorValue);
+    _bgHexCtrl = TextEditingController(text: colorToHex(_tempReadingBgColor));
+    _hlHexCtrl = TextEditingController(text: colorToHex(_tempReadingHighlightColor));
     _tempLogLevel = AppLogger.normalizeLevel(widget.logLevel);
     _tempBackupDir = widget.lastBackupDir;
     _showFishConfigAlways = _tempEngine == 'fish' || widget.apiKey.isNotEmpty;
@@ -347,6 +364,8 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
   @override
   void dispose() {
     _keyCtrl.dispose();
+    _bgHexCtrl.dispose();
+    _hlHexCtrl.dispose();
     for (final ctrl in _customProxyCtrls.values) {
       ctrl.dispose();
     }
@@ -357,6 +376,183 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: Text(title, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF743C00))),
+    );
+  }
+
+  Widget _buildColorEditor({
+    required String title,
+    required Color currentColor,
+    required int defaultColorValue,
+    required List<int> presets,
+    required TextEditingController hexController,
+    required bool expandedRgb,
+    required VoidCallback onToggleRgb,
+    required ValueChanged<Color> onColorChanged,
+  }) {
+    final hexStr = colorToHex(currentColor);
+    final defaultHex = colorToHex(Color(defaultColorValue));
+
+    return Container(
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF6F4EC),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFFE5E1D5)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  color: currentColor,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: Colors.black26, width: 1.2),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  "$title ($hexStr)",
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Color(0xFF2C3238)),
+                ),
+              ),
+              TextButton(
+                style: TextButton.styleFrom(visualDensity: VisualDensity.compact, padding: const EdgeInsets.symmetric(horizontal: 6)),
+                onPressed: () {
+                  final def = Color(defaultColorValue);
+                  hexController.text = defaultHex;
+                  onColorChanged(def);
+                },
+                child: Text("默认 $defaultHex", style: const TextStyle(fontSize: 11.5)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              ...presets.map((cVal) {
+                final c = Color(cVal);
+                final isSelected = (cVal & 0x00FFFFFF) == (currentColor.value & 0x00FFFFFF);
+                return GestureDetector(
+                  onTap: () {
+                    hexController.text = colorToHex(c);
+                    onColorChanged(c);
+                  },
+                  child: Container(
+                    width: 28,
+                    height: 28,
+                    decoration: BoxDecoration(
+                      color: c,
+                      shape: BoxShape.circle,
+                      border: Border.all(
+                        color: isSelected ? const Color(0xFFC87D2E) : Colors.black26,
+                        width: isSelected ? 2.5 : 1,
+                      ),
+                    ),
+                    child: isSelected
+                        ? Icon(Icons.check, size: 15, color: getContrastTextColor(c))
+                        : null,
+                  ),
+                );
+              }),
+              ActionChip(
+                visualDensity: VisualDensity.compact,
+                avatar: Icon(expandedRgb ? Icons.expand_less : Icons.tune, size: 15, color: const Color(0xFFC87D2E)),
+                label: Text(expandedRgb ? "收起自定义" : "自由调色", style: const TextStyle(fontSize: 11)),
+                onPressed: onToggleRgb,
+              ),
+            ],
+          ),
+          if (expandedRgb) ...[
+            const SizedBox(height: 10),
+            Row(
+              children: [
+                SizedBox(
+                  width: 132,
+                  child: TextField(
+                    controller: hexController,
+                    maxLength: 7,
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 12.5),
+                    decoration: const InputDecoration(
+                      labelText: 'Hex 色值',
+                      hintText: '#D2B48C',
+                      counterText: '',
+                      isDense: true,
+                      filled: true,
+                      fillColor: Colors.white,
+                      border: OutlineInputBorder(),
+                    ),
+                    onChanged: (val) {
+                      final cleaned = val.trim().replaceAll('#', '');
+                      if (RegExp(r'^[0-9a-fA-F]{6}$').hasMatch(cleaned)) {
+                        onColorChanged(parseHexColor(cleaned, defaultColorValue));
+                      }
+                    },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    "RGB(${currentColor.red}, ${currentColor.green}, ${currentColor.blue})",
+                    style: const TextStyle(fontSize: 11.5, color: Colors.blueGrey, fontFamily: 'monospace'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            _buildChannelSlider("红 R", currentColor.red, Colors.red.shade600, (r) {
+              final next = Color.fromARGB(255, r, currentColor.green, currentColor.blue);
+              hexController.text = colorToHex(next);
+              onColorChanged(next);
+            }),
+            _buildChannelSlider("绿 G", currentColor.green, Colors.green.shade600, (g) {
+              final next = Color.fromARGB(255, currentColor.red, g, currentColor.blue);
+              hexController.text = colorToHex(next);
+              onColorChanged(next);
+            }),
+            _buildChannelSlider("蓝 B", currentColor.blue, Colors.blue.shade600, (b) {
+              final next = Color.fromARGB(255, currentColor.red, currentColor.green, b);
+              hexController.text = colorToHex(next);
+              onColorChanged(next);
+            }),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChannelSlider(String label, int value, Color activeColor, ValueChanged<int> onChanged) {
+    return Row(
+      children: [
+        SizedBox(width: 34, child: Text(label, style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600))),
+        Expanded(
+          child: SliderTheme(
+            data: SliderTheme.of(context).copyWith(
+              trackHeight: 3,
+              thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+              overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+            ),
+            child: Slider(
+              value: value.toDouble(),
+              min: 0,
+              max: 255,
+              activeColor: activeColor,
+              onChanged: (v) => onChanged(v.round()),
+            ),
+          ),
+        ),
+        SizedBox(
+          width: 28,
+          child: Text("$value", textAlign: TextAlign.right, style: const TextStyle(fontSize: 11, fontFamily: 'monospace')),
+        ),
+      ],
     );
   }
 
@@ -419,10 +615,27 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
               child: Text(
                 widget.networkRouter.detectedSystemProxy?.isNotEmpty == true
                     ? "将使用系统代理: ${widget.networkRouter.detectedSystemProxy}"
-                    : "⚠️ 当前未检测到系统代理，将自动回退直连",
+                    : (Platform.isAndroid && widget.networkRouter.hasActiveVpn
+                        ? "当前处于系统 VPN 接管状态，将走默认系统 VPN 隧道"
+                        : "⚠️ 当前未检测到系统代理或 VPN，将自动回退直连"),
                 style: TextStyle(
                   fontSize: 11.5,
-                  color: widget.networkRouter.detectedSystemProxy?.isNotEmpty == true ? Colors.teal.shade700 : Colors.orange.shade800,
+                  color: (widget.networkRouter.detectedSystemProxy?.isNotEmpty == true || widget.networkRouter.hasActiveVpn)
+                      ? Colors.teal.shade700
+                      : Colors.orange.shade800,
+                ),
+              ),
+            ),
+          ] else if (Platform.isAndroid && widget.networkRouter.hasActiveVpn) ...[
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                widget.networkRouter.hasBypassPhysicalNetwork
+                    ? "将绑定底层物理网卡 (Wi-Fi/蜂窝) 绕过 VPN 直连"
+                    : "⚠️ 未发现可绕过的独立物理网卡，请确认 VPN 允许应用绕过",
+                style: TextStyle(
+                  fontSize: 11.5,
+                  color: widget.networkRouter.hasBypassPhysicalNetwork ? Colors.teal.shade700 : Colors.orange.shade800,
                 ),
               ),
             ),
@@ -453,6 +666,8 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
       followAlong: _tempAutoScroll,
       splitMode: _tempSplit,
       fontSize: _tempFontSize,
+      readingBgColorValue: _tempReadingBgColor.value,
+      readingHighlightColorValue: _tempReadingHighlightColor.value,
       logLevel: _tempLogLevel,
     );
     if (mounted) Navigator.pop(context);
@@ -462,6 +677,10 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
   Widget build(BuildContext context) {
     final allEngineIds = <String>{'ms', 'fish', ...widget.customEngines.map((e) => e.id)};
     if (!allEngineIds.contains(_tempEngine)) _tempEngine = 'ms';
+
+    final previewNormalTextColor = getContrastTextColor(_tempReadingBgColor);
+    final previewHighlightTextColor = getHighlightTextColor(_tempReadingHighlightColor);
+    final previewHighlightAccentColor = getHighlightAccentColor(_tempReadingHighlightColor);
 
     return Scaffold(
       backgroundColor: const Color(0xFFF6F4EC),
@@ -612,7 +831,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                               icon: _probingProxy
                                   ? const SizedBox(width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
                                   : const Icon(Icons.refresh, size: 15),
-                              label: const Text("探测系统代理", style: TextStyle(fontSize: 11.5)),
+                              label: const Text("刷新探测", style: TextStyle(fontSize: 11.5)),
                               onPressed: _probingProxy
                                   ? null
                                   : () async {
@@ -629,7 +848,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                           margin: const EdgeInsets.only(bottom: 12),
                           decoration: BoxDecoration(color: const Color(0xFFEFE7D2), borderRadius: BorderRadius.circular(8)),
                           child: Text(
-                            "系统代理探测结果：${widget.networkRouter.detectedSystemProxy ?? '未检测到系统代理 (直连或手动填端口可用)'}",
+                            widget.networkRouter.describeNetworkBanner(),
                             style: const TextStyle(fontSize: 12, color: Color(0xFF743C00)),
                           ),
                         ),
@@ -643,7 +862,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
 
                 const SizedBox(height: 10),
 
-                // 3. 阅读字体与朗读规则
+                // 3. 阅读排版、背景色、高亮色与朗读规则
                 Card(
                   color: const Color(0xFFFCFBF7),
                   elevation: 0.5,
@@ -653,7 +872,7 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        _buildSectionTitle("📖 排版字体与朗读规则"),
+                        _buildSectionTitle("📖 排版颜色、字体与朗读规则"),
                         Row(
                           mainAxisAlignment: MainAxisAlignment.spaceBetween,
                           children: [
@@ -682,14 +901,68 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                           label: "${_tempFontSize.toStringAsFixed(1).replaceAll('.0', '')} px",
                           onChanged: (v) => setState(() => _tempFontSize = double.parse(v.toStringAsFixed(1))),
                         ),
+                        const SizedBox(height: 6),
+                        _buildColorEditor(
+                          title: "阅读背景色",
+                          currentColor: _tempReadingBgColor,
+                          defaultColorValue: defaultReadingBgColorValue,
+                          presets: presetReadingBgColors,
+                          hexController: _bgHexCtrl,
+                          expandedRgb: _expandBgRgb,
+                          onToggleRgb: () => setState(() => _expandBgRgb = !_expandBgRgb),
+                          onColorChanged: (c) => setState(() => _tempReadingBgColor = c),
+                        ),
+                        const SizedBox(height: 10),
+                        _buildColorEditor(
+                          title: "正在朗读文本高亮",
+                          currentColor: _tempReadingHighlightColor,
+                          defaultColorValue: defaultReadingHighlightColorValue,
+                          presets: presetReadingHighlightColors,
+                          hexController: _hlHexCtrl,
+                          expandedRgb: _expandHlRgb,
+                          onToggleRgb: () => setState(() => _expandHlRgb = !_expandHlRgb),
+                          onColorChanged: (c) => setState(() => _tempReadingHighlightColor = c),
+                        ),
+                        const SizedBox(height: 10),
                         Container(
                           width: double.infinity,
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          padding: const EdgeInsets.all(12),
                           margin: const EdgeInsets.only(bottom: 12),
-                          decoration: BoxDecoration(color: const Color(0xFFF6F4EC), borderRadius: BorderRadius.circular(8)),
-                          child: Text(
-                            "字体预览：春风拂槛露华浓，静听书声伴晚钟。",
-                            style: TextStyle(fontSize: _tempFontSize, color: const Color(0xFF2D2E2F), height: 1.6),
+                          decoration: BoxDecoration(
+                            color: _tempReadingBgColor,
+                            borderRadius: BorderRadius.circular(10),
+                            border: Border.all(color: Colors.black12),
+                          ),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                decoration: BoxDecoration(
+                                  color: _tempReadingHighlightColor,
+                                  borderRadius: BorderRadius.circular(6),
+                                  border: Border(left: BorderSide(color: previewHighlightAccentColor, width: 3.5)),
+                                ),
+                                child: Text(
+                                  "正在朗读高亮：春风拂槛露华浓，静听书声伴晚钟。",
+                                  style: TextStyle(
+                                    fontSize: _tempFontSize,
+                                    color: previewHighlightTextColor,
+                                    fontWeight: FontWeight.w600,
+                                    height: 1.6,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(height: 6),
+                              Padding(
+                                padding: const EdgeInsets.symmetric(horizontal: 10),
+                                child: Text(
+                                  "普通正文效果：山高月小，水落石出，阅尽千帆皆从容。",
+                                  style: TextStyle(fontSize: _tempFontSize, color: previewNormalTextColor, height: 1.6),
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                         DropdownButtonFormField<String>(
@@ -861,7 +1134,6 @@ class _ReaderSettingsPageState extends State<ReaderSettingsPage> {
                               label: const Text("选择文件恢复"),
                               onPressed: () async {
                                 final restored = await widget.onShowRestorePicker();
-                                // 若已成功恢复，直接退出设置页防止点击“保存配置”用旧表单状态覆盖恢复数据
                                 if (restored && mounted) {
                                   Navigator.pop(context);
                                 }
@@ -910,6 +1182,8 @@ class ReaderDialogs {
     required bool followAlong,
     required String splitMode,
     required double fontSize,
+    required int readingBgColorValue,
+    required int readingHighlightColorValue,
     required String logLevel,
     required String lastBackupDir,
     required Future<void> Function() onExportBackup,
@@ -931,6 +1205,8 @@ class ReaderDialogs {
       required bool followAlong,
       required String splitMode,
       required double fontSize,
+      required int readingBgColorValue,
+      required int readingHighlightColorValue,
       required String logLevel,
     }) onSave,
   }) {
@@ -953,6 +1229,8 @@ class ReaderDialogs {
           followAlong: followAlong,
           splitMode: splitMode,
           fontSize: fontSize,
+          readingBgColorValue: readingBgColorValue,
+          readingHighlightColorValue: readingHighlightColorValue,
           logLevel: logLevel,
           lastBackupDir: lastBackupDir,
           onExportBackup: onExportBackup,
@@ -1425,7 +1703,7 @@ class ReaderDialogs {
               const Row(children: [
                 Icon(Icons.extension, color: Color(0xFFC87D2E)),
                 SizedBox(width: 8),
-                Text("自定义 TTS 引擎", style: TextStyle(fontSize: 16)),
+                Text("TTS 引擎管理", style: TextStyle(fontSize: 16)),
               ]),
               FilledButton.tonalIcon(
                 icon: const Icon(Icons.add, size: 16),
@@ -1524,7 +1802,7 @@ class ReaderDialogs {
   }
 
   // 3. 发音人管理与试听中心
-  static void showVoiceManagerDialog({
+  static Future<void> showVoiceManagerDialog({
     required BuildContext context,
     required String currentEngine,
     required String selectedVoiceId,
@@ -1563,7 +1841,7 @@ class ReaderDialogs {
       return userMsVoices;
     }
 
-    showDialog(
+    return showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDlgState) {
@@ -1955,7 +2233,7 @@ class ReaderDialogs {
   }
 
   // 4. 睡眠定时器弹窗
-  static void showSleepTimerDialog({
+  static Future<void> showSleepTimerDialog({
     required BuildContext context,
     required int sleepTimeLeftSeconds,
     required bool sleepStopAfterChapter,
@@ -1965,7 +2243,7 @@ class ReaderDialogs {
   }) {
     int selectedMinutes = sleepTimeLeftSeconds > 0 ? max(1, sleepTimeLeftSeconds ~/ 60) : 30;
 
-    showDialog(
+    return showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDlgState) => AlertDialog(
@@ -2043,7 +2321,7 @@ class ReaderDialogs {
   }
 
   // 5. 运行日志管理界面 (支持 3 层级 error / info / all 与分级着色)
-  static void showLogViewerDialog({
+  static Future<void> showLogViewerDialog({
     required BuildContext context,
     required Function(String newLevel) onLogLevelChanged,
   }) async {
@@ -2056,7 +2334,7 @@ class ReaderDialogs {
     final dialogWidth = min(740.0, screenWidth - 20);
     final dialogHeight = min(640.0, screenHeight * 0.85);
 
-    showDialog(
+    await showDialog(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (context, setDlg) => AlertDialog(
@@ -2369,7 +2647,7 @@ class ReaderDialogs {
   }
 
   // 7. 批量合并 MP3 导出弹窗
-  static void openExportDialog({
+  static Future<void> openExportDialog({
     required BuildContext hostContext,
     required ExportController exportController,
     required List<TextSliceNode> nodes,
@@ -2390,8 +2668,13 @@ class ReaderDialogs {
     required TtsNetworkRouter networkRouter,
     required Function(String newDir) onSaveMp3Dir,
     required Function(int newThreads) onSaveThreads,
-  }) {
-    if (nodes.isEmpty) return;
+  }) async {
+    if (nodes.isEmpty) {
+      ScaffoldMessenger.of(hostContext).showSnackBar(
+        const SnackBar(content: Text("当前没有可导出的文本，请先打开电子书或导入剪贴板文本")),
+      );
+      return;
+    }
 
     int exportMode = alignedChapters.isEmpty ? 1 : 0;
     int selectedChapterIdx = 0;
@@ -2425,7 +2708,7 @@ class ReaderDialogs {
       return userMsVoices;
     }
 
-    showDialog(
+    await showDialog(
       context: hostContext,
       builder: (dlgCtx) => StatefulBuilder(
         builder: (innerCtx, setDlgState) {
@@ -2441,7 +2724,7 @@ class ReaderDialogs {
               title: const Row(children: [
                 Icon(Icons.audio_file_outlined, color: Color(0xFFC87D2E)),
                 SizedBox(width: 8),
-                Text("批量合并导出 MP3"),
+                Text("合成导出 MP3"),
               ]),
               content: SizedBox(
                 width: min(540.0, MediaQuery.of(innerCtx).size.width - 20),
