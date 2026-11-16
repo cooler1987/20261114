@@ -1,4 +1,4 @@
-name: Build Android APK and Windows App
+name: Build Android APK and Windows Portable
 
 on:
   push:
@@ -6,8 +6,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ================= 任務 1：編譯 Android APK =================
-  build-android:
+  build_android:
     name: Build Android APK
     runs-on: ubuntu-latest
 
@@ -77,9 +76,8 @@ jobs:
           path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
 
-  # ================= 任務 2：編譯 Windows 桌面版 =================
-  build-windows:
-    name: Build Windows App
+  build_windows_portable:
+    name: Build Windows Portable ZIP
     runs-on: windows-latest
 
     steps:
@@ -92,20 +90,54 @@ jobs:
           flutter-version: '3.24.x'
           channel: 'stable'
 
-      # 自動生成 windows 平台資料夾 (若倉庫中尚未建立 windows 目錄)
       - name: Ensure Windows Project Files
-        run: flutter create . --platforms=windows --project-name fish_audio_reader
+        shell: pwsh
+        run: |
+          flutter config --enable-windows-desktop
+          flutter create . --platforms=windows --project-name fish_audio_reader
 
       - name: Install Dependencies
+        shell: pwsh
         run: flutter pub get
 
       - name: Build Windows Release
-        run: flutter build windows --release --no-tree-shake-icons
+        shell: pwsh
+        run: flutter build windows --release
 
-      # Windows 編譯結果包含 .exe 與多個 .dll 依賴庫，必須上傳整個 Release 資料夾
-      - name: Upload Windows App
+      - name: Package Windows Portable ZIP
+        shell: pwsh
+        run: |
+          $releaseDir = "build\windows\x64\runner\Release"
+          if (-not (Test-Path $releaseDir)) {
+            $releaseDir = "build\windows\runner\Release"
+          }
+          if (-not (Test-Path $releaseDir)) {
+            throw "Windows Release directory not found!"
+          }
+
+          $stageDir = "build\portable\FishAudioReader-Portable"
+          if (Test-Path $stageDir) { Remove-Item $stageDir -Recurse -Force }
+          New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+          Copy-Item "$releaseDir\*" -Destination $stageDir -Recurse -Force
+
+          # 附带 MSVC 运行库 DLL，避免未装运行库的 Windows 电脑报错缺失 DLL
+          $vcDlls = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")
+          foreach ($dll in $vcDlls) {
+            $src = Join-Path "$env:SystemRoot\System32" $dll
+            if (Test-Path $src) {
+              Copy-Item $src -Destination $stageDir -Force
+            }
+          }
+
+          New-Item -ItemType Directory -Path "$stageDir\data\Backup" -Force | Out-Null
+
+          $zipPath = "build\FishAudioReader-Windows-x64-Portable.zip"
+          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+          Compress-Archive -Path "$stageDir\*" -DestinationPath $zipPath -CompressionLevel Optimal
+
+      - name: Upload Windows Portable ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: fish-audio-reader-windows
-          path: build/windows/x64/runner/Release/
+          name: fish-audio-reader-windows-portable
+          path: build/FishAudioReader-Windows-x64-Portable.zip
           if-no-files-found: error
