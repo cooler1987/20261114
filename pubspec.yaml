@@ -1,4 +1,4 @@
-name: fish_audio_reader
+name: YZreader
 description: "TXT/EPUB/MD Reader with Fish Audio, Microsoft TTS & Custom Engines (WeRead Style)"
 publish_to: 'none'
 version: 3.0.0+1
